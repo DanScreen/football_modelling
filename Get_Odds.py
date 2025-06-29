@@ -40,6 +40,7 @@ def get_odds(sport_key = 'soccer_epl'):
     else:
         print('Remaining requests', odds_response.headers['x-requests-remaining'])
         print('Used requests', odds_response.headers['x-requests-used'])
+        print(odds_json['data'])
     
     betting_odds = []
     for i in range(len(odds_json['data'])):
@@ -53,30 +54,33 @@ def get_odds(sport_key = 'soccer_epl'):
             away_index = 0
 
 
-        sites = []
-        Ohome = []
-        Odraw = []
-        Oaway = []
-        for site in match['sites']:
-            if site['site_nice'] in ['Marathon Bet', '1xBet', 'Matchbook']:
-                continue
-            sites.append(site['site_nice'])
-            Ohome.append(site['odds']['h2h'][home_index])
-            Odraw.append(site['odds']['h2h'][2])
-            Oaway.append(site['odds']['h2h'][away_index])
+#         sites = []
+#         Ohome = []
+#         Odraw = []
+#         Oaway = []
+#         for site in match['sites']:
+#             if site['site_nice'] in ['Marathon Bet', '1xBet', 'Matchbook']:
+#                 continue
+#             sites.append(site['site_nice'])
+#             Ohome.append(site['odds']['h2h'][home_index])
+#             Odraw.append(site['odds']['h2h'][2])
+#             Oaway.append(site['odds']['h2h'][away_index])
         
-        if not (len(sites)==len(Ohome)==len(Odraw)==len(Oaway)):
-            print('Varying lengths of scraped data')
-
-        index_home = np.argmax(Ohome)
-        index_draw = np.argmax(Odraw)
-        index_away = np.argmax(Oaway)
+#         if not (len(sites)==len(Ohome)==len(Odraw)==len(Oaway)):
+#             print('Varying lengths of scraped data')
+        
+#         print(Ohome)
+#         print(Odraw)
+#         index_home = np.argmax(Ohome)
+#         index_draw = np.argmax(Odraw)
+#         index_away = np.argmax(Oaway)
         best_odds = {'match': match['teams'],
                      'time':basetime + datetime.timedelta(seconds=match['commence_time']),
                      'event': ['Home', 'Draw', 'Away'], 
-                     'Bookie': [sites[index_home], sites[index_draw], sites[index_away]],
-                     'Odds': [Ohome[index_home], Odraw[index_draw], Oaway[index_away]]}
-        best_odds['Probs'] = list(1/np.array(best_odds['Odds']))
+#                      'Bookie': [sites[index_home], sites[index_draw], sites[index_away]],
+#                      'Odds': [Ohome[index_home], Odraw[index_draw], Oaway[index_away]]
+                    }
+#        best_odds['Probs'] = list(1/np.array(best_odds['Odds']))
         betting_odds.append(best_odds)
         
     return betting_odds
