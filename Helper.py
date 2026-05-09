@@ -249,7 +249,7 @@ class league_fast():
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
             old_teams = teams    
-            data = pd.read_csv(NS[i], encoding = 'unicode_escape')
+            data = pd.read_csv(NS[i], encoding = 'utf-8-sig')
             data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
             teams = np.unique(data['HomeTeam'])
             teams_out = list(set(old_teams) - set(teams))
@@ -257,14 +257,14 @@ class league_fast():
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = pd.read_csv(NS_below[i], encoding = 'unicode_escape')
+                data_below = pd.read_csv(NS_below[i], encoding = 'utf-8-sig')
                 data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
                 teams_below = np.unique(data_below['HomeTeam'])
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = pd.read_csv(NS_above[i], encoding = 'unicode_escape')
+                data_above = pd.read_csv(NS_above[i], encoding = 'utf-8-sig')
                 data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
                 teams_above = np.unique(data_above['HomeTeam'])
 
@@ -385,7 +385,7 @@ class league():
         data['PDraw'] = pdraw
         data['PAway'] = paway
         
-        self.trained_data = self.trained_data.append(data, ignore_index=True) 
+        self.trained_data = pd.concat([self.trained_data, data], ignore_index=True)
 
     def predict(self, HomeTeam, AwayTeam):
         HT = int(np.arange(self.NT)[self.teams==HomeTeam])
@@ -503,7 +503,7 @@ class league():
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
             old_teams = teams    
-            data = pd.read_csv(NS[i], encoding = 'unicode_escape')
+            data = pd.read_csv(NS[i], encoding = 'utf-8-sig')
             data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
             matches = data.shape[0]
             seasons = np.append(seasons, [SEA[i]]*matches)
@@ -513,14 +513,14 @@ class league():
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = pd.read_csv(NS_below[i], encoding = 'unicode_escape')
+                data_below = pd.read_csv(NS_below[i], encoding = 'utf-8-sig')
                 data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
                 teams_below = np.unique(data_below['HomeTeam'])
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = pd.read_csv(NS_above[i], encoding = 'unicode_escape')
+                data_above = pd.read_csv(NS_above[i], encoding = 'utf-8-sig')
                 data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
                 teams_above = np.unique(data_above['HomeTeam'])
 
@@ -543,27 +543,16 @@ class league():
         NS = []
         for i in SEA:
             NS.append('BettingData/'+str(i)+league_str+'.csv')
-        j=0
+        frames = []
         for i in range(len(NS)):
-            if SEA[i] < 2020:
-                newdata = pd.read_csv(NS[i])
-            else:
-                newdata = pd.read_csv(NS[i])
+            newdata = pd.read_csv(NS[i])
+            if SEA[i] >= 2020:
                 columns = list(newdata.columns)
-                for j in range(len(columns)):
-                    column = columns[j]
-                    columns[j] = re.sub('Max', 'BbMx', column)
-                newdata.columns = columns
-            
+                newdata.columns = [re.sub('Max', 'BbMx', col) for col in columns]
             newdata['Date'] = pd.to_datetime(newdata['Date'], dayfirst=True)
             newdata.insert(1, 'SEA', SEA[i])
-                
-            if j==0:
-                data = newdata[['Div', 'SEA', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR', 'BbMxH', 'BbMxD', 'BbMxA']]
-            else:
-                data = data.append(newdata[['Div', 'SEA', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR', 'BbMxH', 'BbMxD', 'BbMxA']], 
-                                  ignore_index=True)
-            j += 1
+            frames.append(newdata[['Div', 'SEA', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR', 'BbMxH', 'BbMxD', 'BbMxA']])
+        data = pd.concat(frames, ignore_index=True)
         data['BetHome'] = 1/data['BbMxH']
         data['BetDraw'] = 1/data['BbMxD']
         data['BetAway'] = 1/data['BbMxA']
@@ -572,90 +561,37 @@ class league():
 def remove_end_commas(string):
     if len(string)==0:
         string = ''
-    
     elif string[-1] != ',':
         pass
-        
     else:
-        #print(string[0:(len(string)-1)])
         string = remove_end_commas(string[0:(len(string)-1)])
     return string
-        
+
 def read_football_data(file):
     data = []
-    DataFile = open(file, "r")
+    DataFile = open(file, "r", encoding='utf-8-sig')
     i=0
     while True:
         i += 1
-        # Read new line
         newline = DataFile.readline()
         newline = newline.rstrip()
-        # If line empty, stop
         newline = remove_end_commas(newline)
         if len(newline) < 4:
             break
-        #print(newline)
-        #print(len(newline))
-        #split comma seperated values into list
         readData = newline.split(",")
         if i==1:
             columns = np.array(readData)
-
         else:
-            #append data
             data.append(readData)
-
     DataFile.close()
     ftr_pos = int(np.where(columns=='FTR')[0])
     output = pd.DataFrame(data).iloc[:, :(ftr_pos+1)]
     output.columns=columns[:(ftr_pos+1)]
     return output[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
 
-def remove_end_commas(string):
-    if len(string)==0:
-        string = ''
-    
-    elif string[-1] != ',':
-        pass
-        
-    else:
-        #print(string[0:(len(string)-1)])
-        string = remove_end_commas(string[0:(len(string)-1)])
-    return string
-
-def read_football_data(file):
-    data = []
-    DataFile = open(file, "r")
-    i=0
-    while True:
-        i += 1
-        # Read new line
-        newline = DataFile.readline()
-        newline = newline.rstrip()
-        # If line empty, stop
-        newline = remove_end_commas(newline)
-        if len(newline) < 4:
-            break
-        #print(newline)
-        #print(len(newline))
-        #split comma seperated values into list
-        readData = newline.split(",")
-        if i==1:
-            columns = np.array(readData)
-
-        else:
-            #append data
-            data.append(readData)
-
-    DataFile.close()
-    ftr_pos = int(np.where(columns=='FTR')[0])
-    output = pd.DataFrame(data).iloc[:, :(ftr_pos+1)]
-    output.columns=columns[:(ftr_pos+1)]
-    return output
-
 def read_betting_data(file):
     data = []
-    DataFile = open(file, "r")
+    DataFile = open(file, "r", encoding='utf-8-sig')
     i=0
     while True:
         i += 1
