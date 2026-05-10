@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import os
 import pickle
+import uvicorn
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -169,5 +170,4 @@ def upcoming(limit: int = 20):
 
 
 if __name__ == '__main__':
-    import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=8000)
