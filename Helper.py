@@ -101,16 +101,18 @@ class league_fast():
         self.gamma_hat = (self.p_gamma-1)/self.q_gamma
     
     def train(self, data):
+        data['FTHG'] = pd.to_numeric(data['FTHG'])
+        data['FTAG'] = pd.to_numeric(data['FTAG'])
         data.loc[data['FTHG'] > 5, 'FTHG'] = 5
         data.loc[data['FTAG'] > 5, 'FTAG'] = 5
         # iterate through data
         for i in range(data.shape[0]):
             match = data.iloc[[i]]
             # get indices of home and away sides
-            HT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['HomeTeam']])
-            AT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['AwayTeam']])
-            X = int(match['FTHG'])
-            Y = int(match['FTAG'])
+            HT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['HomeTeam']][0])
+            AT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['AwayTeam']][0])
+            X = int(match['FTHG'].iloc[0])
+            Y = int(match['FTAG'].iloc[0])
             
             self.p_alpha[HT] = self.w*self.p_alpha[HT]+X
             self.q_alpha[HT] = self.w*self.q_alpha[HT]+self.beta_hat[AT]*self.gamma_hat[HT]
@@ -133,8 +135,8 @@ class league_fast():
             self.gamma_hat[HT] = (self.p_gamma[HT]-1)/self.q_gamma[HT]
 
     def predict(self, HomeTeam, AwayTeam):
-        HT = int(np.arange(self.NT)[self.teams==HomeTeam])
-        AT = int(np.arange(self.NT)[self.teams==AwayTeam])
+        HT = int(np.arange(self.NT)[self.teams==HomeTeam][0])
+        AT = int(np.arange(self.NT)[self.teams==AwayTeam][0])
         LambdaH = self.alpha_hat[HT]*self.beta_hat[AT]*self.gamma_hat[HT]
         LambdaA = self.alpha_hat[AT]*self.beta_hat[HT]
         
@@ -198,12 +200,12 @@ class league_fast():
                 w_b = 1
                 w3 = 1
                 
-            self.p_alpha = np.append(self.p_alpha, w_b*float(team_data['p_alpha']))
-            self.q_alpha = np.append(self.q_alpha, w_b*float(team_data['q_alpha']))
-            self.p_beta = np.append(self.p_beta, w_b*float(team_data['p_beta']))
-            self.q_beta = np.append(self.q_beta, w_b*float(team_data['q_beta']))
-            self.p_gamma = np.append(self.p_gamma, w3* float(team_data['p_gamma']))
-            self.q_gamma = np.append(self.q_gamma, w3*float(team_data['q_gamma']))
+            self.p_alpha = np.append(self.p_alpha, w_b*float(team_data['p_alpha'].iloc[0] if hasattr(team_data['p_alpha'], 'iloc') else team_data['p_alpha']))
+            self.q_alpha = np.append(self.q_alpha, w_b*float(team_data['q_alpha'].iloc[0] if hasattr(team_data['q_alpha'], 'iloc') else team_data['q_alpha']))
+            self.p_beta = np.append(self.p_beta, w_b*float(team_data['p_beta'].iloc[0] if hasattr(team_data['p_beta'], 'iloc') else team_data['p_beta']))
+            self.q_beta = np.append(self.q_beta, w_b*float(team_data['q_beta'].iloc[0] if hasattr(team_data['q_beta'], 'iloc') else team_data['q_beta']))
+            self.p_gamma = np.append(self.p_gamma, w3*float(team_data['p_gamma'].iloc[0] if hasattr(team_data['p_gamma'], 'iloc') else team_data['p_gamma']))
+            self.q_gamma = np.append(self.q_gamma, w3*float(team_data['q_gamma'].iloc[0] if hasattr(team_data['q_gamma'], 'iloc') else team_data['q_gamma']))
             
         self.alpha_hat = (self.p_alpha-1)/self.q_alpha
         self.beta_hat = (self.p_beta-1)/self.q_beta
@@ -222,22 +224,18 @@ class league_fast():
         
 #         print(NS)
 #         print(NS_below)
-        data = pd.read_csv(NS[0])
-        data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
-#        display(data['HomeTeam'])
+        data = read_football_data(NS[0])
         teams = np.unique(data['HomeTeam'])
-        
+
         self.teams = teams
         self.NT = len(teams)
 
         if league_below:
-            data_below = pd.read_csv(NS_below[0])
-            data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            data_below = read_football_data(NS_below[0])
             teams_below = np.unique(data_below['HomeTeam'])
 
         if league_above:
-            data_above = pd.read_csv(NS_above[0])
-            data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            data_above = read_football_data(NS_above[0])
             teams_above = np.unique(data_above['HomeTeam'])
 
         print('Season: ' + str(SEA[0]), end="\r")
@@ -248,37 +246,31 @@ class league_fast():
         for i in range(1, len(NS)):
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
-            old_teams = teams    
-            data = pd.read_csv(NS[i], encoding = 'utf-8-sig')
-            data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            old_teams = teams
+            data = read_football_data(NS[i])
             teams = np.unique(data['HomeTeam'])
             teams_out = list(set(old_teams) - set(teams))
 
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = pd.read_csv(NS_below[i], encoding = 'utf-8-sig')
-                data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+                data_below = read_football_data(NS_below[i])
                 teams_below = np.unique(data_below['HomeTeam'])
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = pd.read_csv(NS_above[i], encoding = 'utf-8-sig')
-                data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+                data_above = read_football_data(NS_above[i])
                 teams_above = np.unique(data_above['HomeTeam'])
 
             if league_below:
                 promoted_in =  sorted(list(set(old_teams_below) & set(teams)))
             if league_above:
                 relegated_in = sorted(list(set(old_teams_above) & set(teams)))
-            
+
             if not (league_below or league_above):
                 promoted_in =  sorted(list(set(teams) - set(old_teams)))
-                
 
-            #print('Teams Out:' + str(teams_out))
-            #print('Promoted In:' + str(promoted_in))
             self.new_season(teams_out, promoted_in, relegated_in)
             self.train(data)
         print('Training Complete')
@@ -328,6 +320,8 @@ class league():
         self.gamma_hat = (self.p_gamma-1)/self.q_gamma
     
     def train(self, data):
+        data['FTHG'] = pd.to_numeric(data['FTHG'])
+        data['FTAG'] = pd.to_numeric(data['FTAG'])
         data.loc[data['FTHG'] > 5, 'FTHG'] = 5
         data.loc[data['FTAG'] > 5, 'FTAG'] = 5
         
@@ -339,8 +333,8 @@ class league():
         for i in range(data.shape[0]):
             match = data.iloc[[i]]
             # get indices of home and away sides
-            HT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['HomeTeam']])
-            AT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['AwayTeam']])
+            HT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['HomeTeam']][0])
+            AT = int(np.arange(self.NT)[self.teams==match.iloc[0].loc['AwayTeam']][0])
             # get home and away lambda
             lambdaH = self.alpha_hat[HT]*self.beta_hat[AT]*self.gamma_hat[HT]
             lambdasH.append(lambdaH)
@@ -348,8 +342,8 @@ class league():
             lambdaA = self.alpha_hat[AT]*self.beta_hat[HT]
             lambdasA.append(lambdaA)
             
-            X = int(match['FTHG'])
-            Y = int(match['FTAG'])
+            X = int(match['FTHG'].iloc[0])
+            Y = int(match['FTAG'].iloc[0])
             
             self.p_alpha[HT] = self.w*self.p_alpha[HT]+X
             self.q_alpha[HT] = self.w*self.q_alpha[HT]+self.beta_hat[AT]*self.gamma_hat[HT]
@@ -388,8 +382,8 @@ class league():
         self.trained_data = pd.concat([self.trained_data, data], ignore_index=True)
 
     def predict(self, HomeTeam, AwayTeam):
-        HT = int(np.arange(self.NT)[self.teams==HomeTeam])
-        AT = int(np.arange(self.NT)[self.teams==AwayTeam])
+        HT = int(np.arange(self.NT)[self.teams==HomeTeam][0])
+        AT = int(np.arange(self.NT)[self.teams==AwayTeam][0])
         LambdaH = self.alpha_hat[HT]*self.beta_hat[AT]*self.gamma_hat[HT]
         LambdaA = self.alpha_hat[AT]*self.beta_hat[HT]
         
@@ -453,12 +447,12 @@ class league():
                 w_b = 1
                 w3 = 1
                 
-            self.p_alpha = np.append(self.p_alpha, w_b*float(team_data['p_alpha']))
-            self.q_alpha = np.append(self.q_alpha, w_b*float(team_data['q_alpha']))
-            self.p_beta = np.append(self.p_beta, w_b*float(team_data['p_beta']))
-            self.q_beta = np.append(self.q_beta, w_b*float(team_data['q_beta']))
-            self.p_gamma = np.append(self.p_gamma, w3* float(team_data['p_gamma']))
-            self.q_gamma = np.append(self.q_gamma, w3*float(team_data['q_gamma']))
+            self.p_alpha = np.append(self.p_alpha, w_b*float(team_data['p_alpha'].iloc[0] if hasattr(team_data['p_alpha'], 'iloc') else team_data['p_alpha']))
+            self.q_alpha = np.append(self.q_alpha, w_b*float(team_data['q_alpha'].iloc[0] if hasattr(team_data['q_alpha'], 'iloc') else team_data['q_alpha']))
+            self.p_beta = np.append(self.p_beta, w_b*float(team_data['p_beta'].iloc[0] if hasattr(team_data['p_beta'], 'iloc') else team_data['p_beta']))
+            self.q_beta = np.append(self.q_beta, w_b*float(team_data['q_beta'].iloc[0] if hasattr(team_data['q_beta'], 'iloc') else team_data['q_beta']))
+            self.p_gamma = np.append(self.p_gamma, w3*float(team_data['p_gamma'].iloc[0] if hasattr(team_data['p_gamma'], 'iloc') else team_data['p_gamma']))
+            self.q_gamma = np.append(self.q_gamma, w3*float(team_data['q_gamma'].iloc[0] if hasattr(team_data['q_gamma'], 'iloc') else team_data['q_gamma']))
             
         self.alpha_hat = (self.p_alpha-1)/self.q_alpha
         self.beta_hat = (self.p_beta-1)/self.q_beta
@@ -475,21 +469,18 @@ class league():
             if league_above:
                 NS_above.append('AutoData/'+str(i)+str(league_above)+'.csv')
         
-        data = pd.read_csv(NS[0])
-        data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+        data = read_football_data(NS[0])
         teams = np.unique(data['HomeTeam'])
-        
+
         self.teams = teams
         self.NT = len(teams)
 
         if league_below:
-            data_below = pd.read_csv(NS_below[0])
-            data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            data_below = read_football_data(NS_below[0])
             teams_below = np.unique(data_below['HomeTeam'])
 
         if league_above:
-            data_above = pd.read_csv(NS_above[0])
-            data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            data_above = read_football_data(NS_above[0])
             teams_above = np.unique(data_above['HomeTeam'])
 
         print('Season: ' + str(SEA[0]), end="\r")
@@ -502,9 +493,8 @@ class league():
         for i in range(1, len(NS)):
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
-            old_teams = teams    
-            data = pd.read_csv(NS[i], encoding = 'utf-8-sig')
-            data = data[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+            old_teams = teams
+            data = read_football_data(NS[i])
             matches = data.shape[0]
             seasons = np.append(seasons, [SEA[i]]*matches)
             teams = np.unique(data['HomeTeam'])
@@ -513,27 +503,23 @@ class league():
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = pd.read_csv(NS_below[i], encoding = 'utf-8-sig')
-                data_below = data_below[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+                data_below = read_football_data(NS_below[i])
                 teams_below = np.unique(data_below['HomeTeam'])
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = pd.read_csv(NS_above[i], encoding = 'utf-8-sig')
-                data_above = data_above[['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']]
+                data_above = read_football_data(NS_above[i])
                 teams_above = np.unique(data_above['HomeTeam'])
 
             if league_below:
                 promoted_in =  sorted(list(set(old_teams_below) & set(teams)))
             if league_above:
                 relegated_in = sorted(list(set(old_teams_above) & set(teams)))
-                
+
             if not (league_below or league_above):
                 promoted_in =  sorted(list(set(teams) - set(old_teams)))
 
-            #print('Teams Out:' + str(teams_out))
-            #print('Promoted In:' + str(promoted_in))
             self.new_season(teams_out, promoted_in, relegated_in)
             self.train(data)
         self.trained_data.insert(0, 'SEA', seasons)
@@ -569,7 +555,7 @@ def remove_end_commas(string):
 
 def read_football_data(file):
     data = []
-    DataFile = open(file, "r", encoding='utf-8-sig')
+    DataFile = open(file, "r", encoding='latin-1')
     i=0
     while True:
         i += 1
@@ -591,7 +577,7 @@ def read_football_data(file):
 
 def read_betting_data(file):
     data = []
-    DataFile = open(file, "r", encoding='utf-8-sig')
+    DataFile = open(file, "r", encoding='latin-1')
     i=0
     while True:
         i += 1
