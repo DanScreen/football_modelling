@@ -15,13 +15,17 @@ Each match prediction returns **two** scorelines:
 
 | File | Purpose |
 |---|---|
-| `app.py` | FastAPI application — train, predict, and forecast upcoming fixtures |
+| `app.py` | FastAPI application — train, predict, forecast upcoming fixtures, render HTML, archive to GCS |
 | `Helper.py` | Core Bayesian model classes (`league`, `league_fast`) and CSV parsers |
 | `get_data.py` | Download match/betting CSVs (`fetch_csv`, `download_match_data`, `download_betting_data`) |
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
 | `AutoData/`, `BettingData/` | Downloaded CSVs (created on first data download) |
 | `pl_model.pkl` | Pickled trained model (created on first `/train`) |
+| `Dockerfile` / `.dockerignore` | Container build for Cloud Run |
+| `requirements.txt` | Pinned Python deps for the container |
+| `terraform/` | Cloud Run, GCS, Cloud Scheduler, and Workload Identity Federation infra |
+| `.github/workflows/deploy.yml` | GitHub Actions pipeline that builds and deploys to Cloud Run |
 
 ## Setup
 
@@ -36,11 +40,17 @@ source .venv/bin/activate
 pip install fastapi 'uvicorn[standard]' pandas numpy scipy requests
 ```
 
-Optional environment variables:
+Environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ODDS_API_KEY` | hardcoded fallback in `Get_Odds.py` | API key for [the-odds-api.com](https://the-odds-api.com/) |
+| `MODEL_PATH` | `pl_model.pkl` | Local pickle path for the trained model |
+| `GCS_BUCKET` | _(unset)_ | If set, model is loaded/saved from this bucket and predictions are archived there |
+| `MODEL_BLOB` | `models/pl_model.pkl` | GCS object path for the model pickle |
+| `ARCHIVE_PREFIX` | `predictions/` | GCS prefix for daily prediction archive (key is `<prefix><YYYY-MM-DD>.json`) |
+| `API_KEY` | _(unset, auth disabled)_ | If set, `/train` and `/predictions/archive` require `X-API-Key: <value>` |
+| `PORT` | `8000` (`8080` in container) | Port uvicorn listens on |
 
 ## Running the API
 
@@ -134,6 +144,29 @@ expected SuperBru score for picking that scoreline. The two scorelines often dif
 e.g. a 1-1 draw can be the SuperBru-optimal pick even when 2-1 is more likely, because
 1-1 collects "close" points across more probable outcomes.
 
+### `GET /predictions/today`
+
+Mobile-friendly HTML page summarising the next N upcoming fixtures with most-likely
+scoreline, SuperBru-optimal scoreline (with expected points), and outcome probabilities.
+Designed to be bookmarked on an iPhone home screen — dark theme, no JS, single-tap viewing.
+
+```
+http://localhost:8000/predictions/today?limit=20
+```
+
+### `POST /predictions/archive`
+
+Same data as `/predictions/upcoming`, but also writes the JSON to GCS at
+`gs://$GCS_BUCKET/${ARCHIVE_PREFIX}<YYYY-MM-DD>.json` for backtesting later. Intended
+to be called once a day by Cloud Scheduler. Requires `X-API-Key` header if `API_KEY` is set.
+
+```bash
+curl -X POST 'https://<service-url>/predictions/archive?limit=20' \
+     -H "X-API-Key: $API_KEY"
+```
+
+Response includes `archived_uri`, `generated_at`, `count`, and `matches` (same shape as `/predictions/upcoming`).
+
 ### `GET /predictions/upcoming`
 
 Predicted scores for the next N upcoming Premier League fixtures, pulled live from the
@@ -183,6 +216,79 @@ Response:
 2. First-time setup: `POST /train` with `{"download_data": true}` to download CSVs and train.
 3. Subsequent restarts auto-load `pl_model.pkl` — no retraining needed unless you want fresh data.
 4. Hit `GET /predictions/upcoming` for fixture-by-fixture predictions.
+
+## Deployment to GCP Cloud Run
+
+The service is designed to run on Cloud Run. The deployment provisions:
+
+- **Cloud Run service** (`football-api`) running the FastAPI container
+- **Artifact Registry** repo for the Docker image
+- **GCS bucket** (`<project>-football-data`) holding the model pickle and daily prediction archive
+- **Secret Manager** secrets for `ODDS_API_KEY` and `API_KEY`
+- **Cloud Scheduler** job that POSTs `/predictions/archive` daily
+- **Workload Identity Federation** so GitHub Actions can deploy without service-account JSON keys
+
+### One-time infrastructure setup
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars: set project_id and github_repo
+
+terraform init
+terraform apply
+```
+
+Outputs include:
+- `service_url` — public Cloud Run URL (bookmark `<url>/predictions/today` on your phone)
+- `bucket_name`, `deployer_service_account`, `workload_identity_provider`, `artifact_registry_uri`
+
+After `terraform apply`, populate the Secret Manager secrets:
+
+```bash
+echo -n 'your-odds-api-key' | gcloud secrets versions add odds-api-key --data-file=-
+echo -n 'your-shared-api-key' | gcloud secrets versions add football-api-key --data-file=-
+
+# Patch the Cloud Scheduler job to use the real key
+gcloud scheduler jobs update http football-daily-archive \
+  --location <region> \
+  --update-headers "X-API-Key=your-shared-api-key,Content-Type=application/json"
+```
+
+Train the model locally and upload the pickle to GCS so cold starts can load it:
+
+```bash
+python app.py &
+curl -X POST localhost:8000/train -H "Content-Type: application/json" -d '{"download_data": true}'
+gsutil cp pl_model.pkl gs://<project>-football-data/models/pl_model.pkl
+```
+
+(Alternatively, after the container is deployed, hit `/train` against the Cloud Run URL — it
+will write the pickle directly to GCS.)
+
+### GitHub Actions setup
+
+Add the following to your GitHub repo:
+
+- **Repository variables** (`Settings → Secrets and variables → Actions → Variables`):
+  - `GCP_PROJECT` — your project ID
+  - `GCP_REGION` — e.g. `europe-west2`
+- **Repository secrets**:
+  - `WIF_PROVIDER` — value of the `workload_identity_provider` Terraform output
+  - `DEPLOYER_SA` — value of the `deployer_service_account` output
+
+Pushes to `main` or `deploy_to_gcp` will build the image, push it to Artifact Registry,
+and roll out a new Cloud Run revision.
+
+### Daily flow
+
+1. **08:00 UTC** Cloud Scheduler fires → `POST /predictions/archive` on Cloud Run.
+2. Cloud Run loads the pickled model from GCS (or reuses the warm instance), calls the odds
+   API for upcoming fixtures, computes predictions, and writes
+   `gs://<bucket>/predictions/<YYYY-MM-DD>.json`.
+3. Whenever you want to view, open the bookmark on your iPhone:
+   `https://<service-url>/predictions/today` — renders the latest fixtures as a mobile
+   page with most-likely and SuperBru-optimal scorelines.
 
 ## Notebooks
 

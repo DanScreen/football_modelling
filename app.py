@@ -1,21 +1,27 @@
 #!/usr/bin/env python
+import json
 import os
 import pickle
 import uvicorn
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from Helper import league, get_points_matrix
 from Get_Odds import get_odds
 from get_data import download_match_data
 
+MODEL_PATH = os.environ.get('MODEL_PATH', 'pl_model.pkl')
+GCS_BUCKET = os.environ.get('GCS_BUCKET')
+MODEL_BLOB = os.environ.get('MODEL_BLOB', 'models/pl_model.pkl')
+ARCHIVE_PREFIX = os.environ.get('ARCHIVE_PREFIX', 'predictions/')
+API_KEY = os.environ.get('API_KEY')
 SUPERBRU_MAX_GOALS = 6
-
-MODEL_PATH = 'pl_model.pkl'
 
 CONVERT_NAMES = {
     'Arsenal': 'Arsenal', 'Aston Villa': 'Aston Villa',
@@ -54,15 +60,61 @@ def _superbru_optimal(prediction_matrix):
     }
 
 
+def _gcs_client():
+    from google.cloud import storage
+    return storage.Client()
+
+
+def _load_model():
+    if GCS_BUCKET:
+        try:
+            blob = _gcs_client().bucket(GCS_BUCKET).blob(MODEL_BLOB)
+            if blob.exists():
+                model = pickle.loads(blob.download_as_bytes())
+                print(f'Loaded model from gs://{GCS_BUCKET}/{MODEL_BLOB}')
+                return model
+            print(f'No model at gs://{GCS_BUCKET}/{MODEL_BLOB}')
+        except Exception as e:
+            print(f'GCS model load failed: {e}')
+    if os.path.exists(MODEL_PATH):
+        with open(MODEL_PATH, 'rb') as f:
+            print(f'Loaded model from {MODEL_PATH}')
+            return pickle.load(f)
+    return None
+
+
+def _save_model(model):
+    payload = pickle.dumps(model)
+    with open(MODEL_PATH, 'wb') as f:
+        f.write(payload)
+    if GCS_BUCKET:
+        _gcs_client().bucket(GCS_BUCKET).blob(MODEL_BLOB).upload_from_string(
+            payload, content_type='application/octet-stream'
+        )
+        print(f'Uploaded model to gs://{GCS_BUCKET}/{MODEL_BLOB}')
+
+
+def _archive_predictions(payload):
+    if not GCS_BUCKET:
+        return None
+    date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    blob_path = f'{ARCHIVE_PREFIX}{date_str}.json'
+    _gcs_client().bucket(GCS_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(payload, indent=2, default=str), content_type='application/json'
+    )
+    return f'gs://{GCS_BUCKET}/{blob_path}'
+
+
+def _require_api_key(provided: Optional[str]):
+    if not API_KEY:
+        return  # auth disabled
+    if provided != API_KEY:
+        raise HTTPException(401, 'Invalid or missing X-API-Key header')
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if os.path.exists(MODEL_PATH):
-        try:
-            with open(MODEL_PATH, 'rb') as f:
-                state['model'] = pickle.load(f)
-            print(f'Loaded model from {MODEL_PATH}')
-        except Exception as e:
-            print(f'Failed to load {MODEL_PATH}: {e}')
+    state['model'] = _load_model()
     yield
 
 
@@ -107,44 +159,7 @@ def _format_prediction(home, away, prediction, commence_time=None):
     return out
 
 
-@app.get('/health')
-def health():
-    return {'status': 'ok', 'model_loaded': state['model'] is not None}
-
-
-@app.post('/train')
-def train(req: TrainRequest):
-    if req.download_data:
-        download_match_data(year_range=range(1996, 2027), leagues=['E0', 'E1'])
-    seasons = req.seasons or list(range(1996, 2027))
-    PL = league()
-    PL.train_all(league_str='E0', league_below='E1', SEA=seasons)
-    state['model'] = PL
-    with open(MODEL_PATH, 'wb') as f:
-        pickle.dump(PL, f)
-    return {
-        'status': 'trained',
-        'seasons': seasons,
-        'teams': list(PL.teams),
-        'model_path': MODEL_PATH,
-    }
-
-
-@app.post('/predict')
-def predict(req: PredictRequest):
-    PL = state['model']
-    if PL is None:
-        raise HTTPException(503, 'Model not trained. POST /train first.')
-    if req.home_team not in PL.teams:
-        raise HTTPException(400, f"Unknown home team '{req.home_team}'. Known teams: {list(PL.teams)}")
-    if req.away_team not in PL.teams:
-        raise HTTPException(400, f"Unknown away team '{req.away_team}'. Known teams: {list(PL.teams)}")
-    prediction = PL.predict(req.home_team, req.away_team)
-    return _format_prediction(req.home_team, req.away_team, prediction)
-
-
-@app.get('/predictions/upcoming')
-def upcoming(limit: int = 20):
+def _build_upcoming(limit: int):
     PL = state['model']
     if PL is None:
         raise HTTPException(503, 'Model not trained. POST /train first.')
@@ -169,5 +184,145 @@ def upcoming(limit: int = 20):
     return {'count': len(results), 'matches': results}
 
 
+@app.get('/health')
+def health():
+    return {'status': 'ok', 'model_loaded': state['model'] is not None}
+
+
+@app.post('/train')
+def train(req: TrainRequest, x_api_key: Optional[str] = Header(default=None)):
+    _require_api_key(x_api_key)
+    if req.download_data:
+        download_match_data(year_range=range(1996, 2027), leagues=['E0', 'E1'])
+    seasons = req.seasons or list(range(1996, 2027))
+    PL = league()
+    PL.train_all(league_str='E0', league_below='E1', SEA=seasons)
+    state['model'] = PL
+    _save_model(PL)
+    return {
+        'status': 'trained',
+        'seasons': seasons,
+        'teams': list(PL.teams),
+        'model_path': MODEL_PATH,
+        'gcs_uri': f'gs://{GCS_BUCKET}/{MODEL_BLOB}' if GCS_BUCKET else None,
+    }
+
+
+@app.post('/predict')
+def predict(req: PredictRequest):
+    PL = state['model']
+    if PL is None:
+        raise HTTPException(503, 'Model not trained. POST /train first.')
+    if req.home_team not in PL.teams:
+        raise HTTPException(400, f"Unknown home team '{req.home_team}'. Known teams: {list(PL.teams)}")
+    if req.away_team not in PL.teams:
+        raise HTTPException(400, f"Unknown away team '{req.away_team}'. Known teams: {list(PL.teams)}")
+    prediction = PL.predict(req.home_team, req.away_team)
+    return _format_prediction(req.home_team, req.away_team, prediction)
+
+
+@app.get('/predictions/upcoming')
+def upcoming(limit: int = 20):
+    return _build_upcoming(limit)
+
+
+@app.post('/predictions/archive')
+def archive(
+    limit: int = Query(default=20),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    payload = _build_upcoming(limit)
+    payload['generated_at'] = datetime.now(timezone.utc).isoformat()
+    archived_uri = _archive_predictions(payload)
+    return {'archived_uri': archived_uri, **payload}
+
+
+@app.get('/predictions/today', response_class=HTMLResponse)
+def today(limit: int = 20):
+    payload = _build_upcoming(limit)
+    return _render_html(payload)
+
+
+def _render_html(payload):
+    rows = []
+    for m in payload['matches']:
+        if 'error' in m:
+            rows.append(f"""
+            <article class="match unknown">
+              <header>{m['home_team']} vs {m['away_team']}</header>
+              <p class="error">{m['error']}</p>
+            </article>""")
+            continue
+        ml = m['most_likely_score']
+        sb = m['superbru_optimal_score']
+        probs = m['probabilities']
+        kickoff = m['commence_time'].replace('T', ' ')[:16] + ' UTC'
+        rows.append(f"""
+        <article class="match">
+          <header>{m['home_team']} <span class="vs">vs</span> {m['away_team']}</header>
+          <p class="kickoff">{kickoff}</p>
+          <div class="scores">
+            <div class="score">
+              <span class="label">Most likely</span>
+              <span class="value">{ml['home']}–{ml['away']}</span>
+            </div>
+            <div class="score sb">
+              <span class="label">SuperBru pick</span>
+              <span class="value">{sb['home']}–{sb['away']}</span>
+              <span class="ep">{sb['expected_points']:.2f} xPts</span>
+            </div>
+          </div>
+          <div class="probs">
+            <span>H {probs['home_win']*100:.0f}%</span>
+            <span>D {probs['draw']*100:.0f}%</span>
+            <span>A {probs['away_win']*100:.0f}%</span>
+          </div>
+        </article>""")
+    generated = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>EPL Predictions</title>
+  <style>
+    :root {{
+      --bg: #0f1115; --card: #1a1d24; --border: #262a33;
+      --text: #e8eaed; --muted: #8a93a3; --accent: #4ade80; --warn: #fbbf24;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; padding: 16px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+           background: var(--bg); color: var(--text); }}
+    h1 {{ margin: 8px 0 4px; font-size: 20px; }}
+    .meta {{ color: var(--muted); font-size: 13px; margin-bottom: 16px; }}
+    .match {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+              padding: 14px; margin-bottom: 12px; }}
+    .match header {{ font-weight: 600; font-size: 16px; }}
+    .match .vs {{ color: var(--muted); font-weight: 400; padding: 0 4px; }}
+    .kickoff {{ color: var(--muted); font-size: 12px; margin: 4px 0 10px; }}
+    .scores {{ display: flex; gap: 12px; margin-bottom: 10px; }}
+    .score {{ flex: 1; background: #14171d; border: 1px solid var(--border);
+              border-radius: 8px; padding: 8px 10px; }}
+    .score.sb {{ border-color: var(--accent); }}
+    .score .label {{ display: block; font-size: 11px; color: var(--muted); text-transform: uppercase;
+                     letter-spacing: 0.5px; }}
+    .score .value {{ display: block; font-size: 22px; font-weight: 700; margin-top: 2px; }}
+    .score .ep {{ display: block; font-size: 11px; color: var(--accent); margin-top: 2px; }}
+    .probs {{ display: flex; gap: 12px; font-size: 12px; color: var(--muted); }}
+    .match.unknown {{ opacity: 0.6; }}
+    .error {{ color: var(--warn); font-size: 13px; margin: 4px 0 0; }}
+  </style>
+</head>
+<body>
+  <h1>EPL predictions</h1>
+  <p class="meta">{payload['count']} fixtures · generated {generated}</p>
+  {''.join(rows) if rows else '<p class="meta">No fixtures returned.</p>'}
+</body>
+</html>"""
+
+
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+    port = int(os.environ.get('PORT', 8000))
+    uvicorn.run(app, host='0.0.0.0', port=port)
