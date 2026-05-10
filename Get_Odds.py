@@ -10,7 +10,7 @@ import datetime
 basetime = datetime.datetime(year=1970, month=1, day=1, hour=1)
 
 def get_odds(sport_key='soccer_epl'):
-    api_key = os.environ.get('ODDS_API_KEY')
+    api_key = os.environ.get('ODDS_API_KEY', '8eed4238adf2be8a8f66ee3c2624c5ee')
     if not api_key:
         raise ValueError("ODDS_API_KEY environment variable not set")
 
