@@ -5,6 +5,12 @@ The underlying model uses Gamma–Poisson conjugate priors over team attacking/d
 strengths and home-ground advantage, trained on historical results from
 [football-data.co.uk](https://www.football-data.co.uk/).
 
+Each match prediction returns **two** scorelines:
+- `most_likely_score` — the single scoreline with the highest probability under the model
+- `superbru_optimal_score` — the scoreline that maximises expected SuperBru points,
+  computed by weighting the SuperBru points matrix for each candidate scoreline by the
+  model's full joint probability distribution over scores
+
 ## Project layout
 
 | File | Purpose |
@@ -110,7 +116,8 @@ Response:
 {
   "home_team": "Arsenal",
   "away_team": "Chelsea",
-  "predicted_score": { "home": 2, "away": 1 },
+  "most_likely_score": { "home": 2, "away": 1 },
+  "superbru_optimal_score": { "home": 1, "away": 1, "expected_points": 1.42 },
   "probabilities": {
     "home_win": 0.52,
     "draw": 0.26,
@@ -118,6 +125,14 @@ Response:
   }
 }
 ```
+
+`most_likely_score` is the single highest-probability scoreline. `superbru_optimal_score`
+is the scoreline that maximises expected SuperBru points (1.5 for "close", 3 for exact,
+plus result points), computed by integrating each candidate scoreline's points matrix
+against the model's joint probability distribution. `expected_points` is the resulting
+expected SuperBru score for picking that scoreline. The two scorelines often differ —
+e.g. a 1-1 draw can be the SuperBru-optimal pick even when 2-1 is more likely, because
+1-1 collects "close" points across more probable outcomes.
 
 ### `GET /predictions/upcoming`
 
@@ -150,7 +165,8 @@ Response:
       "home_team": "Liverpool",
       "away_team": "Man City",
       "commence_time": "2026-05-18T16:30:00+00:00",
-      "predicted_score": { "home": 2, "away": 1 },
+      "most_likely_score": { "home": 2, "away": 1 },
+      "superbru_optimal_score": { "home": 1, "away": 1, "expected_points": 1.38 },
       "probabilities": {
         "home_win": 0.48,
         "draw": 0.27,
