@@ -8,9 +8,11 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from Helper import league
+from Helper import league, get_points_matrix
 from Get_Odds import get_odds
 from get_data import download_match_data
+
+SUPERBRU_MAX_GOALS = 6
 
 MODEL_PATH = 'pl_model.pkl'
 
@@ -36,6 +38,19 @@ state = {'model': None}
 
 def _to_int(v):
     return int(np.ravel(v)[0])
+
+
+def _superbru_optimal(prediction_matrix):
+    exp_points = np.zeros((SUPERBRU_MAX_GOALS, SUPERBRU_MAX_GOALS))
+    for home in range(SUPERBRU_MAX_GOALS):
+        for away in range(SUPERBRU_MAX_GOALS):
+            exp_points[home, away] = float(np.sum(get_points_matrix(home, away) * prediction_matrix))
+    idx = np.unravel_index(int(np.argmax(exp_points)), exp_points.shape)
+    return {
+        'home': int(idx[0]),
+        'away': int(idx[1]),
+        'expected_points': float(exp_points[idx]),
+    }
 
 
 @asynccontextmanager
@@ -70,10 +85,16 @@ class PredictRequest(BaseModel):
 def _format_prediction(home, away, prediction, commence_time=None):
     score = prediction['result']
     probs = prediction['outcomes']
+    sb = _superbru_optimal(prediction['matrix'])
     out = {
         'home_team': home,
         'away_team': away,
-        'predicted_score': {'home': _to_int(score[0]), 'away': _to_int(score[1])},
+        'most_likely_score': {'home': _to_int(score[0]), 'away': _to_int(score[1])},
+        'superbru_optimal_score': {
+            'home': sb['home'],
+            'away': sb['away'],
+            'expected_points': sb['expected_points'],
+        },
         'probabilities': {
             'home_win': float(probs[0]),
             'draw': float(probs[1]),
