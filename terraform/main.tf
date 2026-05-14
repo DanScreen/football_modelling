@@ -40,8 +40,6 @@ resource "google_storage_bucket" "data" {
   uniform_bucket_level_access = true
   force_destroy               = false
 
-  versioning { enabled = true }
-
   lifecycle_rule {
     condition { age = 365 }
     action { type = "Delete" }
