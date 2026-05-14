@@ -79,13 +79,17 @@ resource "google_storage_bucket_iam_member" "run_bucket_access" {
 # ----------------------------------------------------------------------
 resource "google_secret_manager_secret" "odds_api_key" {
   secret_id = "odds-api-key"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
   depends_on = [google_project_service.apis]
 }
 
 resource "google_secret_manager_secret" "api_key" {
   secret_id = "football-api-key"
-  replication { auto {} }
+  replication {
+    auto {}
+  }
   depends_on = [google_project_service.apis]
 }
 
