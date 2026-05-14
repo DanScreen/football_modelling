@@ -111,6 +111,18 @@ resource "google_cloud_run_v2_service" "api" {
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
 
+  # The image is owned by the GitHub Actions deploy pipeline after the first
+  # successful build. Terraform creates the service with a placeholder so the
+  # resource can exist before any image is built; CI overwrites the image on
+  # every push without Terraform reverting it on the next `apply`.
+  lifecycle {
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].containers[0].image,
+    ]
+  }
+
   template {
     service_account = google_service_account.run.email
 
@@ -120,7 +132,7 @@ resource "google_cloud_run_v2_service" "api" {
     }
 
     containers {
-      image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo}/${var.service_name}:latest"
+      image = "us-docker.pkg.dev/cloudrun/container/hello"
 
       resources {
         limits = {
