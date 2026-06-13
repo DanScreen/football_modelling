@@ -115,6 +115,22 @@ resource "google_secret_manager_secret" "betfair_password" {
   depends_on = [google_project_service.apis]
 }
 
+resource "google_secret_manager_secret" "betfair_cert" {
+  secret_id = "betfair-cert"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "betfair_key" {
+  secret_id = "betfair-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_secret_manager_secret_iam_member" "run_odds" {
   secret_id = google_secret_manager_secret.odds_api_key.id
   role      = "roles/secretmanager.secretAccessor"
@@ -141,6 +157,18 @@ resource "google_secret_manager_secret_iam_member" "run_betfair_username" {
 
 resource "google_secret_manager_secret_iam_member" "run_betfair_password" {
   secret_id = google_secret_manager_secret.betfair_password.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_betfair_cert" {
+  secret_id = google_secret_manager_secret.betfair_cert.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_betfair_key" {
+  secret_id = google_secret_manager_secret.betfair_key.id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.run.email}"
 }
@@ -236,6 +264,24 @@ resource "google_cloud_run_v2_service" "api" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.betfair_password.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "BETFAIR_CERT"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.betfair_cert.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "BETFAIR_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.betfair_key.secret_id
             version = "latest"
           }
         }
