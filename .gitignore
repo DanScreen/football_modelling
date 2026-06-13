@@ -1,0 +1,5 @@
+# Betfair client certificate / private key — never commit
+betfair-certs/
+*.key
+*.crt
+*.pem
