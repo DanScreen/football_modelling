@@ -19,6 +19,7 @@ Each match prediction returns **two** scorelines:
 | `Helper.py` | Core Bayesian model classes (`league`, `league_fast`) and CSV parsers |
 | `get_data.py` | Download match/betting CSVs (`fetch_csv`, `download_match_data`, `download_betting_data`) |
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
+| `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` odds for World Cup fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
 | `AutoData/`, `BettingData/` | Downloaded CSVs (created on first data download) |
 | `pl_model.pkl` | Pickled trained model (created on first `/train`) |
@@ -50,6 +51,10 @@ Environment variables:
 | `MODEL_BLOB` | `models/pl_model.pkl` | GCS object path for the model pickle |
 | `ARCHIVE_PREFIX` | `predictions/` | GCS prefix for daily prediction archive (key is `<prefix><YYYY-MM-DD>.json`) |
 | `API_KEY` | _(unset, auth disabled)_ | If set, `/train` and `/predictions/archive` require `X-API-Key: <value>` |
+| `BETFAIR_APP_KEY` | _(unset)_ | Betfair Delayed Application Key — required for `/predictions/worldcup` |
+| `BETFAIR_USERNAME` | _(unset)_ | Betfair account username (interactive login) |
+| `BETFAIR_PASSWORD` | _(unset)_ | Betfair account password (interactive login) |
+| `BETFAIR_WC_QUERY` | `FIFA World Cup` | Text query used to locate the World Cup competition on the exchange |
 | `PORT` | `8000` (`8080` in container) | Port uvicorn listens on |
 
 ## Running the API
@@ -210,6 +215,64 @@ Response:
 }
 ```
 
+### `GET /predictions/worldcup`
+
+SuperBru-optimal scorelines for upcoming **FIFA World Cup** fixtures, derived from **real
+per-scoreline odds on the Betfair Exchange** — no trained model and no Poisson assumption.
+
+How it works:
+
+1. Logs in to the Betfair Exchange API (interactive login, free Delayed App Key).
+2. Finds upcoming World Cup `CORRECT_SCORE` markets (soccer `eventTypeId=1`) and pulls the
+   best-back price for every quoted scoreline runner.
+3. **De-vigs** the whole correct-score ladder — including the *Any Other Home/Draw/Away Win*
+   buckets — by normalising the implied probabilities back to sum to 1.
+4. Picks both the most-likely explicit scoreline and the **SuperBru-optimal** scoreline,
+   integrating the real scoreline probabilities against the SuperBru points matrix. The
+   *Any Other …* buckets contribute result points only (they can't yield exact/close points).
+
+This endpoint does **not** require a trained model — probabilities come straight from the
+exchange. It **does** require `BETFAIR_APP_KEY`, `BETFAIR_USERNAME`, and `BETFAIR_PASSWORD`.
+
+Query parameters:
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | `20` | Maximum number of fixtures to return |
+
+```bash
+curl 'http://localhost:8000/predictions/worldcup?limit=10'
+```
+
+Response:
+
+```json
+{
+  "count": 1,
+  "matches": [
+    {
+      "home_team": "Brazil",
+      "away_team": "Serbia",
+      "commence_time": "2026-06-20T19:00:00+00:00",
+      "most_likely_score": { "home": 1, "away": 0 },
+      "superbru_optimal_score": { "home": 1, "away": 0, "expected_points": 0.93 },
+      "probabilities": { "home_win": 0.55, "draw": 0.33, "away_win": 0.11 },
+      "overround": 1.06
+    }
+  ]
+}
+```
+
+`probabilities` are the de-vigged exchange win/draw/win probabilities; `overround` is the raw
+book sum before de-vigging (a measure of the market margin). Fixtures with no correct-score
+market or liquidity are returned with an `error` field instead of a prediction.
+
+> Notes:
+> - Use the **free Delayed Application Key** — delayed prices are fine for daily predictions;
+>   the paid Live key is only needed to place bets in real time.
+> - The exchange typically only lists `CORRECT_SCORE` markets with liquidity close to kickoff
+>   for major fixtures, so early group games may be thin or absent until nearer the tournament.
+
 ## Typical workflow
 
 1. Start the server: `uvicorn app:app --reload`
@@ -224,7 +287,7 @@ The service is designed to run on Cloud Run. The deployment provisions:
 - **Cloud Run service** (`football-api`) running the FastAPI container
 - **Artifact Registry** repo for the Docker image
 - **GCS bucket** (`<project>-football-data`) holding the model pickle and daily prediction archive
-- **Secret Manager** secrets for `ODDS_API_KEY` and `API_KEY`
+- **Secret Manager** secrets for `ODDS_API_KEY`, `API_KEY`, and Betfair credentials (`betfair-app-key`, `betfair-username`, `betfair-password`)
 - **Cloud Scheduler** job that POSTs `/predictions/archive` daily
 - **Workload Identity Federation** so GitHub Actions can deploy without service-account JSON keys
 
@@ -243,11 +306,30 @@ Outputs include:
 - `service_url` — public Cloud Run URL (bookmark `<url>/predictions/today` on your phone)
 - `bucket_name`, `deployer_service_account`, `workload_identity_provider`, `artifact_registry_uri`
 
-After `terraform apply`, populate the Secret Manager secrets:
+Populate the Secret Manager secrets with their values. Because the Cloud Run service mounts
+these secrets at version `latest`, each secret must have **at least one version before the
+service is deployed** — otherwise the revision fails to start. If `terraform apply` errors
+on the Cloud Run service because a secret has no versions, create the secret containers
+first with a targeted apply, add the versions, then re-run the full apply:
 
 ```bash
-echo -n 'your-odds-api-key' | gcloud secrets versions add odds-api-key --data-file=-
+# (only if needed) create just the secret containers first
+terraform apply \
+  -target=google_secret_manager_secret.odds_api_key \
+  -target=google_secret_manager_secret.api_key \
+  -target=google_secret_manager_secret.betfair_app_key \
+  -target=google_secret_manager_secret.betfair_username \
+  -target=google_secret_manager_secret.betfair_password
+
+# add the actual secret values (replace the quoted text with your real values)
+echo -n 'your-odds-api-key'   | gcloud secrets versions add odds-api-key     --data-file=-
 echo -n 'your-shared-api-key' | gcloud secrets versions add football-api-key --data-file=-
+echo -n 'your-betfair-app-key'  | gcloud secrets versions add betfair-app-key  --data-file=-
+echo -n 'your-betfair-username' | gcloud secrets versions add betfair-username --data-file=-
+echo -n 'your-betfair-password' | gcloud secrets versions add betfair-password --data-file=-
+
+# then run the full apply to wire everything into Cloud Run
+terraform apply
 
 # Patch the Cloud Scheduler job to use the real key
 gcloud scheduler jobs update http football-daily-archive \

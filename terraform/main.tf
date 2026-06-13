@@ -40,8 +40,6 @@ resource "google_storage_bucket" "data" {
   uniform_bucket_level_access = true
   force_destroy               = false
 
-  versioning { enabled = true }
-
   lifecycle_rule {
     condition { age = 365 }
     action { type = "Delete" }
@@ -93,6 +91,30 @@ resource "google_secret_manager_secret" "api_key" {
   depends_on = [google_project_service.apis]
 }
 
+resource "google_secret_manager_secret" "betfair_app_key" {
+  secret_id = "betfair-app-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "betfair_username" {
+  secret_id = "betfair-username"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "betfair_password" {
+  secret_id = "betfair-password"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_secret_manager_secret_iam_member" "run_odds" {
   secret_id = google_secret_manager_secret.odds_api_key.id
   role      = "roles/secretmanager.secretAccessor"
@@ -105,6 +127,24 @@ resource "google_secret_manager_secret_iam_member" "run_api" {
   member    = "serviceAccount:${google_service_account.run.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "run_betfair_app_key" {
+  secret_id = google_secret_manager_secret.betfair_app_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_betfair_username" {
+  secret_id = google_secret_manager_secret.betfair_username.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_betfair_password" {
+  secret_id = google_secret_manager_secret.betfair_password.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
 # ----------------------------------------------------------------------
 # Cloud Run service
 # ----------------------------------------------------------------------
@@ -112,6 +152,18 @@ resource "google_cloud_run_v2_service" "api" {
   name     = var.service_name
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
+
+  # The image is owned by the GitHub Actions deploy pipeline after the first
+  # successful build. Terraform creates the service with a placeholder so the
+  # resource can exist before any image is built; CI overwrites the image on
+  # every push without Terraform reverting it on the next `apply`.
+  lifecycle {
+    ignore_changes = [
+      client,
+      client_version,
+      template[0].containers[0].image,
+    ]
+  }
 
   template {
     service_account = google_service_account.run.email
@@ -122,7 +174,7 @@ resource "google_cloud_run_v2_service" "api" {
     }
 
     containers {
-      image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_repo}/${var.service_name}:latest"
+      image = "us-docker.pkg.dev/cloudrun/container/hello"
 
       resources {
         limits = {
@@ -157,6 +209,33 @@ resource "google_cloud_run_v2_service" "api" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "BETFAIR_APP_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.betfair_app_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "BETFAIR_USERNAME"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.betfair_username.secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "BETFAIR_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.betfair_password.secret_id
             version = "latest"
           }
         }

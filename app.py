@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from Helper import league, get_points_matrix
 from Get_Odds import get_odds
+from Betfair import get_worldcup_correct_score, BetfairError
 from get_data import download_match_data
 
 MODEL_PATH = os.environ.get('MODEL_PATH', 'pl_model.pkl')
@@ -58,6 +59,37 @@ def _superbru_optimal(prediction_matrix):
         'away': int(idx[1]),
         'expected_points': float(exp_points[idx]),
     }
+
+
+def _result_region(home, away):
+    return 'home' if home > away else ('draw' if home == away else 'away')
+
+
+def _superbru_optimal_betfair(scorelines, other):
+    """Pick the scoreline maximising expected SuperBru points, using real
+    per-scoreline probabilities from Betfair. Explicit scorelines contribute
+    exact/close/result points via the points matrix; the 'any other home/draw/
+    away win' buckets can only ever yield result points, so they're added as a
+    flat result-point term for any candidate whose result matches the bucket."""
+    best = None
+    for ch in range(SUPERBRU_MAX_GOALS):
+        for ca in range(SUPERBRU_MAX_GOALS):
+            pts = get_points_matrix(ch, ca)
+            exp = 0.0
+            for (i, j), p in scorelines.items():
+                if i < 9 and j < 9:
+                    exp += p * pts[i, j]
+            exp += other.get(_result_region(ch, ca), 0.0)  # result point only
+            if best is None or exp > best['expected_points']:
+                best = {'home': ch, 'away': ca, 'expected_points': float(exp)}
+    return best
+
+
+def _outcome_probs(scorelines, other):
+    probs = {'home': other.get('home', 0.0), 'draw': other.get('draw', 0.0), 'away': other.get('away', 0.0)}
+    for (i, j), p in scorelines.items():
+        probs[_result_region(i, j)] += p
+    return {'home_win': probs['home'], 'draw': probs['draw'], 'away_win': probs['away']}
 
 
 def _gcs_client():
@@ -184,6 +216,45 @@ def _build_upcoming(limit: int):
     return {'count': len(results), 'matches': results}
 
 
+def _build_worldcup_betfair(limit: int):
+    """Predict World Cup scorelines from real Betfair CORRECT_SCORE odds.
+    No trained model and no Poisson assumption — probabilities come straight
+    from the (de-vigged) exchange prices for each scoreline."""
+    try:
+        matches = get_worldcup_correct_score(max_markets=limit)
+    except BetfairError as e:
+        raise HTTPException(502, f'Betfair error: {e}')
+    if not matches:
+        raise HTTPException(502, 'No FIFA World Cup correct-score markets available on Betfair.')
+    results = []
+    for m in matches[:limit]:
+        home, away = m['match']
+        scorelines = m['scorelines']
+        other = m['other']
+        commence = m['time'].isoformat() if m['time'] else None
+        if not scorelines and not any(other.values()):
+            results.append({
+                'home_team': home,
+                'away_team': away,
+                'commence_time': commence,
+                'error': 'no correct-score liquidity on Betfair',
+            })
+            continue
+        ml = max(scorelines, key=scorelines.get) if scorelines else None
+        sb = _superbru_optimal_betfair(scorelines, other)
+        out = {
+            'home_team': home,
+            'away_team': away,
+            'commence_time': commence,
+            'most_likely_score': {'home': ml[0], 'away': ml[1]} if ml else None,
+            'superbru_optimal_score': sb,
+            'probabilities': _outcome_probs(scorelines, other),
+            'overround': round(m['overround'], 4),
+        }
+        results.append(out)
+    return {'count': len(results), 'matches': results}
+
+
 @app.get('/health')
 def health():
     return {'status': 'ok', 'model_loaded': state['model'] is not None}
@@ -224,6 +295,11 @@ def predict(req: PredictRequest):
 @app.get('/predictions/upcoming')
 def upcoming(limit: int = 20):
     return _build_upcoming(limit)
+
+
+@app.get('/predictions/worldcup')
+def worldcup(limit: int = 20):
+    return _build_worldcup_betfair(limit)
 
 
 @app.post('/predictions/archive')
