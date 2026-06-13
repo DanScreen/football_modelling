@@ -2,18 +2,25 @@
 # coding: utf-8
 """Minimal Betfair Exchange API client.
 
-Interactive login + read-only access to the CORRECT_SCORE market, so we can
-source real per-scoreline odds (rather than inferring them from 1X2). Uses the
-free Delayed Application Key — prices are delayed but fine for daily modelling.
+Login (certificate or interactive) + read-only access to the CORRECT_SCORE
+market, so we can source real per-scoreline odds (rather than inferring them
+from 1X2). Uses the free Delayed Application Key — prices are delayed but fine
+for daily modelling.
+
+Accounts with two-factor auth enabled (required for app keys) cannot use the
+interactive login endpoint, so certificate login is the default when a client
+cert is available.
 """
 
 import os
 import re
 import datetime
+import tempfile
 
 import requests
 
 IDENTITY_URL = 'https://identitysso.betfair.com/api/login'
+CERT_LOGIN_URL = 'https://identitysso-cert.betfair.com/api/certlogin'
 BETTING_URL = 'https://api.betfair.com/exchange/betting/json-rpc/v1'
 SOCCER_EVENT_TYPE_ID = '1'
 
@@ -27,8 +34,58 @@ class BetfairError(Exception):
     pass
 
 
-def login(app_key, username, password):
-    """Interactive login — returns a session token used as X-Authentication."""
+def _resolve_cert():
+    """Return a (cert_path, key_path) tuple for certificate login, or None.
+
+    Supports either direct file paths (BETFAIR_CERT_FILE / BETFAIR_KEY_FILE) or
+    raw PEM contents (BETFAIR_CERT / BETFAIR_KEY) which are written to temp
+    files — the latter suits Cloud Run, where the cert is injected as a secret.
+    """
+    cert_file = os.environ.get('BETFAIR_CERT_FILE')
+    key_file = os.environ.get('BETFAIR_KEY_FILE')
+    if cert_file and key_file:
+        return cert_file, key_file
+
+    cert_pem = os.environ.get('BETFAIR_CERT')
+    key_pem = os.environ.get('BETFAIR_KEY')
+    if cert_pem and key_pem:
+        cf = tempfile.NamedTemporaryFile('w', suffix='.crt', delete=False)
+        cf.write(cert_pem)
+        cf.close()
+        kf = tempfile.NamedTemporaryFile('w', suffix='.key', delete=False)
+        kf.write(key_pem)
+        kf.close()
+        return cf.name, kf.name
+
+    return None
+
+
+def login(app_key, username, password, cert=None):
+    """Return a session token (used as X-Authentication).
+
+    If a client certificate is supplied, use non-interactive certificate login
+    (the only path that works for 2FA-enabled accounts); otherwise fall back to
+    interactive username/password login.
+    """
+    if cert:
+        resp = requests.post(
+            CERT_LOGIN_URL,
+            data={'username': username, 'password': password},
+            headers={
+                'X-Application': app_key,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept': 'application/json',
+            },
+            cert=cert,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise BetfairError(f'cert login HTTP {resp.status_code}: {resp.text}')
+        body = resp.json()
+        if body.get('loginStatus') != 'SUCCESS':
+            raise BetfairError(f"cert login failed: {body.get('loginStatus')}")
+        return body['sessionToken']
+
     resp = requests.post(
         IDENTITY_URL,
         data={'username': username, 'password': password},
@@ -118,7 +175,7 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
     if not (app_key and username and password):
         raise BetfairError('BETFAIR_APP_KEY, BETFAIR_USERNAME and BETFAIR_PASSWORD must be set')
 
-    token = login(app_key, username, password)
+    token = login(app_key, username, password, cert=_resolve_cert())
     now_iso = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
     catalogue = _rpc('listMarketCatalogue', {
