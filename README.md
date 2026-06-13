@@ -52,8 +52,10 @@ Environment variables:
 | `ARCHIVE_PREFIX` | `predictions/` | GCS prefix for daily prediction archive (key is `<prefix><YYYY-MM-DD>.json`) |
 | `API_KEY` | _(unset, auth disabled)_ | If set, `/train` and `/predictions/archive` require `X-API-Key: <value>` |
 | `BETFAIR_APP_KEY` | _(unset)_ | Betfair Delayed Application Key — required for `/predictions/worldcup` |
-| `BETFAIR_USERNAME` | _(unset)_ | Betfair account username (interactive login) |
-| `BETFAIR_PASSWORD` | _(unset)_ | Betfair account password (interactive login) |
+| `BETFAIR_USERNAME` | _(unset)_ | Betfair account **username** (not email) |
+| `BETFAIR_PASSWORD` | _(unset)_ | Betfair account password |
+| `BETFAIR_CERT_FILE` / `BETFAIR_KEY_FILE` | _(unset)_ | Paths to the client cert/key for certificate login (local dev) |
+| `BETFAIR_CERT` / `BETFAIR_KEY` | _(unset)_ | PEM **contents** of the client cert/key (used on Cloud Run, injected as secrets) |
 | `BETFAIR_WC_QUERY` | `FIFA World Cup` | Text query used to locate the World Cup competition on the exchange |
 | `PORT` | `8000` (`8080` in container) | Port uvicorn listens on |
 
@@ -232,7 +234,18 @@ How it works:
    *Any Other …* buckets contribute result points only (they can't yield exact/close points).
 
 This endpoint does **not** require a trained model — probabilities come straight from the
-exchange. It **does** require `BETFAIR_APP_KEY`, `BETFAIR_USERNAME`, and `BETFAIR_PASSWORD`.
+exchange. It **does** require Betfair credentials (`BETFAIR_APP_KEY`, `BETFAIR_USERNAME`,
+`BETFAIR_PASSWORD`). Betfair accounts that hold an app key have two-factor auth enabled, which
+blocks interactive login, so **certificate login is used**: generate a self-signed cert,
+upload the `.crt` to your Betfair account, and provide the pair via `BETFAIR_CERT_FILE` /
+`BETFAIR_KEY_FILE` (local) or `BETFAIR_CERT` / `BETFAIR_KEY` PEM contents (Cloud Run).
+
+```bash
+# generate the client cert/key (then upload client.crt to your Betfair account)
+mkdir -p betfair-certs
+openssl req -newkey rsa:2048 -nodes -keyout betfair-certs/client.key \
+  -x509 -days 1095 -out betfair-certs/client.crt -subj "/CN=football-modelling"
+```
 
 Query parameters:
 
@@ -319,7 +332,9 @@ terraform apply \
   -target=google_secret_manager_secret.api_key \
   -target=google_secret_manager_secret.betfair_app_key \
   -target=google_secret_manager_secret.betfair_username \
-  -target=google_secret_manager_secret.betfair_password
+  -target=google_secret_manager_secret.betfair_password \
+  -target=google_secret_manager_secret.betfair_cert \
+  -target=google_secret_manager_secret.betfair_key
 
 # add the actual secret values (replace the quoted text with your real values)
 echo -n 'your-odds-api-key'   | gcloud secrets versions add odds-api-key     --data-file=-
@@ -327,6 +342,10 @@ echo -n 'your-shared-api-key' | gcloud secrets versions add football-api-key --d
 echo -n 'your-betfair-app-key'  | gcloud secrets versions add betfair-app-key  --data-file=-
 echo -n 'your-betfair-username' | gcloud secrets versions add betfair-username --data-file=-
 echo -n 'your-betfair-password' | gcloud secrets versions add betfair-password --data-file=-
+
+# the cert and key go in straight from the files (PEM contents)
+gcloud secrets versions add betfair-cert --data-file=../betfair-certs/client.crt
+gcloud secrets versions add betfair-key  --data-file=../betfair-certs/client.key
 
 # then run the full apply to wire everything into Cloud Run
 terraform apply
