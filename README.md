@@ -270,15 +270,31 @@ Response:
       "most_likely_score": { "home": 1, "away": 0 },
       "superbru_optimal_score": { "home": 1, "away": 0, "expected_points": 0.93 },
       "probabilities": { "home_win": 0.55, "draw": 0.33, "away_win": 0.11 },
+      "top_scorelines": [
+        { "home": 1, "away": 0, "prob": 0.14 },
+        { "home": 1, "away": 1, "prob": 0.12 }
+      ],
       "overround": 1.06
     }
   ]
 }
 ```
 
-`probabilities` are the de-vigged exchange win/draw/win probabilities; `overround` is the raw
+`probabilities` are the de-vigged exchange win/draw/win probabilities; `top_scorelines` is the
+de-vigged probability of each most-likely explicit scoreline (up to 6); `overround` is the raw
 book sum before de-vigging (a measure of the market margin). Fixtures with no correct-score
 market or liquidity are returned with an `error` field instead of a prediction.
+
+### `GET /predictions/worldcup/html`
+
+Mobile-friendly HTML view of the same World Cup correct-score predictions. Each match shows a
+home/draw/away probability bar, the most-likely scoreline alongside the SuperBru-optimal pick
+(with expected points), and the top scorelines as chips (the SuperBru pick highlighted). Same
+`limit` query param and same Betfair credential requirements as `/predictions/worldcup`.
+
+```
+http://localhost:8000/predictions/worldcup/html?limit=20
+```
 
 > Notes:
 > - Use the **free Delayed Application Key** — delayed prices are fine for daily predictions;
@@ -316,7 +332,7 @@ terraform apply
 ```
 
 Outputs include:
-- `service_url` — public Cloud Run URL (bookmark `<url>/predictions/today` on your phone)
+- `service_url` — public Cloud Run URL (bookmark `<url>/predictions/today` or `<url>/predictions/worldcup/html` on your phone)
 - `bucket_name`, `deployer_service_account`, `workload_identity_provider`, `artifact_registry_uri`
 
 Populate the Secret Manager secrets with their values. Because the Cloud Run service mounts
