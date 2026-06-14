@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import html
 import json
 import os
 import pickle
@@ -241,6 +242,10 @@ def _build_worldcup_betfair(limit: int):
             continue
         ml = max(scorelines, key=scorelines.get) if scorelines else None
         sb = _superbru_optimal_betfair(scorelines, other)
+        top = sorted(scorelines.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        top_scorelines = [
+            {'home': k[0], 'away': k[1], 'prob': round(v, 4)} for k, v in top
+        ]
         out = {
             'home_team': home,
             'away_team': away,
@@ -248,6 +253,7 @@ def _build_worldcup_betfair(limit: int):
             'most_likely_score': {'home': ml[0], 'away': ml[1]} if ml else None,
             'superbru_optimal_score': sb,
             'probabilities': _outcome_probs(scorelines, other),
+            'top_scorelines': top_scorelines,
             'overround': round(m['overround'], 4),
         }
         results.append(out)
@@ -394,6 +400,145 @@ def _render_html(payload):
   <h1>EPL predictions</h1>
   <p class="meta">{payload['count']} fixtures · generated {generated}</p>
   {''.join(rows) if rows else '<p class="meta">No fixtures returned.</p>'}
+</body>
+</html>"""
+
+
+@app.get('/predictions/worldcup/html', response_class=HTMLResponse)
+def worldcup_html(limit: int = 20):
+    payload = _build_worldcup_betfair(limit)
+    return _render_worldcup_html(payload)
+
+
+def _prob_bar(probs):
+    h = probs['home_win'] * 100
+    d = probs['draw'] * 100
+    a = probs['away_win'] * 100
+    return f"""
+          <div class="bar" role="img" aria-label="Home {h:.0f}%, Draw {d:.0f}%, Away {a:.0f}%">
+            <span class="seg home" style="width:{h:.2f}%"></span>
+            <span class="seg draw" style="width:{d:.2f}%"></span>
+            <span class="seg away" style="width:{a:.2f}%"></span>
+          </div>
+          <div class="bar-legend">
+            <span class="lg"><i class="dot home"></i>Home {h:.0f}%</span>
+            <span class="lg"><i class="dot draw"></i>Draw {d:.0f}%</span>
+            <span class="lg"><i class="dot away"></i>Away {a:.0f}%</span>
+          </div>"""
+
+
+def _render_worldcup_html(payload):
+    rows = []
+    for m in payload['matches']:
+        home = html.escape(str(m['home_team']))
+        away = html.escape(str(m['away_team']))
+        if 'error' in m:
+            rows.append(f"""
+        <article class="match unknown">
+          <header><span class="team">{home}</span><span class="vs">v</span><span class="team">{away}</span></header>
+          <p class="error">{html.escape(str(m['error']))}</p>
+        </article>""")
+            continue
+        ml = m['most_likely_score']
+        sb = m['superbru_optimal_score']
+        ml_str = f"{ml['home']}–{ml['away']}" if ml else "—"
+        kickoff = (m['commence_time'].replace('T', ' ')[:16] + ' UTC') if m.get('commence_time') else 'TBC'
+        chips = []
+        for s in m.get('top_scorelines', []):
+            is_sb = s['home'] == sb['home'] and s['away'] == sb['away']
+            chips.append(
+                f"""<span class="chip{' sb' if is_sb else ''}">{s['home']}–{s['away']}"""
+                f"""<i>{s['prob']*100:.0f}%</i></span>"""
+            )
+        chips_html = ''.join(chips) or '<span class="chip muted">no scoreline liquidity</span>'
+        rows.append(f"""
+        <article class="match">
+          <header><span class="team">{home}</span><span class="vs">v</span><span class="team">{away}</span></header>
+          <p class="kickoff">{kickoff}</p>
+          {_prob_bar(m['probabilities'])}
+          <div class="scores">
+            <div class="score">
+              <span class="label">Most likely</span>
+              <span class="value">{ml_str}</span>
+            </div>
+            <div class="score sb">
+              <span class="label">SuperBru pick</span>
+              <span class="value">{sb['home']}–{sb['away']}</span>
+              <span class="ep">{sb['expected_points']:.2f} xPts</span>
+            </div>
+          </div>
+          <div class="chips">{chips_html}</div>
+        </article>""")
+    generated = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    body = ''.join(rows) if rows else '<p class="meta">No World Cup correct-score markets available right now.</p>'
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>World Cup Predictions</title>
+  <style>
+    :root {{
+      --bg: #0b0e14; --card: #161a23; --card2: #11141b; --border: #232936;
+      --text: #eef1f6; --muted: #8b95a7; --accent: #4ade80;
+      --home: #38bdf8; --draw: #a78bfa; --away: #fb7185;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; padding: 0 16px 40px; color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: radial-gradient(1200px 600px at 50% -200px, #1b2333 0%, var(--bg) 60%); }}
+    .wrap {{ max-width: 720px; margin: 0 auto; }}
+    .hero {{ padding: 28px 4px 18px; }}
+    .hero h1 {{ margin: 0; font-size: 26px; letter-spacing: -0.5px; }}
+    .hero .sub {{ color: var(--muted); font-size: 13px; margin-top: 6px; }}
+    .match {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+              padding: 16px; margin-bottom: 14px; box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset; }}
+    .match header {{ display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 650; }}
+    .match .team {{ flex: 1; }}
+    .match .team:last-child {{ text-align: right; }}
+    .match .vs {{ color: var(--muted); font-weight: 500; font-size: 13px; flex: 0; }}
+    .kickoff {{ color: var(--muted); font-size: 12px; margin: 6px 0 12px; }}
+    .bar {{ display: flex; height: 10px; border-radius: 6px; overflow: hidden; background: var(--card2); }}
+    .bar .seg {{ display: block; height: 100%; }}
+    .bar .seg.home {{ background: var(--home); }}
+    .bar .seg.draw {{ background: var(--draw); }}
+    .bar .seg.away {{ background: var(--away); }}
+    .bar-legend {{ display: flex; gap: 14px; margin: 8px 0 14px; font-size: 12px; color: var(--muted); }}
+    .bar-legend .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }}
+    .dot.home {{ background: var(--home); }}
+    .dot.draw {{ background: var(--draw); }}
+    .dot.away {{ background: var(--away); }}
+    .scores {{ display: flex; gap: 12px; margin-bottom: 12px; }}
+    .score {{ flex: 1; background: var(--card2); border: 1px solid var(--border);
+              border-radius: 10px; padding: 10px 12px; }}
+    .score.sb {{ border-color: var(--accent); background: linear-gradient(180deg, rgba(74,222,128,0.08), var(--card2)); }}
+    .score .label {{ display: block; font-size: 10px; color: var(--muted); text-transform: uppercase;
+                     letter-spacing: 0.6px; }}
+    .score .value {{ display: block; font-size: 24px; font-weight: 750; margin-top: 3px; }}
+    .score .ep {{ display: block; font-size: 11px; color: var(--accent); margin-top: 3px; font-weight: 600; }}
+    .chips {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .chip {{ font-size: 12px; background: var(--card2); border: 1px solid var(--border);
+             border-radius: 999px; padding: 4px 10px; color: var(--text); }}
+    .chip i {{ color: var(--muted); font-style: normal; margin-left: 6px; }}
+    .chip.sb {{ border-color: var(--accent); color: var(--accent); }}
+    .chip.sb i {{ color: var(--accent); }}
+    .chip.muted {{ color: var(--muted); }}
+    .match.unknown {{ opacity: 0.6; }}
+    .error {{ color: #fbbf24; font-size: 13px; margin: 6px 0 0; }}
+    .meta {{ color: var(--muted); font-size: 13px; }}
+    footer {{ color: var(--muted); font-size: 11px; text-align: center; margin-top: 18px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <h1>World Cup predictions</h1>
+      <p class="sub">{payload['count']} matches · de-vigged Betfair correct-score odds · {generated}</p>
+    </div>
+    {body}
+    <footer>Probabilities derived from Betfair Exchange best-back prices, normalised to remove the overround.</footer>
+  </div>
 </body>
 </html>"""
 
