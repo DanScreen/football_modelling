@@ -19,7 +19,7 @@ Each match prediction returns **two** scorelines:
 | `Helper.py` | Core Bayesian model classes (`league`, `league_fast`) and CSV parsers |
 | `get_data.py` | Download match/betting CSVs (`fetch_csv`, `download_match_data`, `download_betting_data`) |
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
-| `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` odds for World Cup fixtures |
+| `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` (and knockout `TO_QUALIFY`) odds for World Cup fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
 | `AutoData/`, `BettingData/` | Downloaded CSVs (created on first data download) |
 | `pl_model.pkl` | Pickled trained model (created on first `/train`) |
@@ -229,9 +229,23 @@ How it works:
    best-back price for every quoted scoreline runner.
 3. **De-vigs** the whole correct-score ladder — including the *Any Other Home/Draw/Away Win*
    buckets — by normalising the implied probabilities back to sum to 1.
-4. Picks both the most-likely explicit scoreline and the **SuperBru-optimal** scoreline,
+4. For **knockout ties**, remodels the distribution onto the score after **120 minutes**
+   (see below) — since SuperBru scores knockouts on the extra-time score, not 90 minutes.
+5. Picks both the most-likely explicit scoreline and the **SuperBru-optimal** scoreline,
    integrating the real scoreline probabilities against the SuperBru points matrix. The
    *Any Other …* buckets contribute result points only (they can't yield exact/close points).
+
+**Knockout / extra-time handling.** `CORRECT_SCORE` settles on 90 minutes, but SuperBru
+scores World Cup knockouts on the score after **120 minutes** (penalties don't count — a
+120-minute draw stays a draw). A tie is detected as a knockout when Betfair lists a
+`TO_QUALIFY` market for it. For those fixtures the 90-minute distribution is transformed into
+a 120-minute one: decisive 90-minute scores carry through unchanged, while 90-minute draws
+play out extra time as independent Poisson goals. The **total** extra-time goal rate comes
+from the correct-score market's implied expected goals (scaled to the 30-minute period, mildly
+dampened), and the **home/away split** of that rate is calibrated so the resulting win-skew
+matches the `TO_QUALIFY` market — exact under a 50/50 penalty-shootout assumption. Knockout
+matches carry `"knockout": true`, `"score_basis": "120min"`, and a `qualify` block; group
+games carry `"score_basis": "90min"` and are untouched.
 
 This endpoint does **not** require a trained model — probabilities come straight from the
 exchange. It **does** require Betfair credentials (`BETFAIR_APP_KEY`, `BETFAIR_USERNAME`,
@@ -265,32 +279,44 @@ Response:
   "matches": [
     {
       "home_team": "Brazil",
-      "away_team": "Serbia",
-      "commence_time": "2026-06-20T19:00:00+00:00",
-      "most_likely_score": { "home": 1, "away": 0 },
-      "superbru_optimal_score": { "home": 1, "away": 0, "expected_points": 0.93 },
+      "away_team": "Croatia",
+      "commence_time": "2026-07-09T19:00:00+00:00",
+      "knockout": true,
+      "score_basis": "120min",
+      "most_likely_score": { "home": 2, "away": 1 },
+      "superbru_optimal_score": { "home": 2, "away": 1, "expected_points": 0.93 },
+      "superbru_optimal_score_90min": { "home": 1, "away": 1, "expected_points": 0.67 },
       "probabilities": { "home_win": 0.55, "draw": 0.33, "away_win": 0.11 },
       "top_scorelines": [
-        { "home": 1, "away": 0, "prob": 0.14 },
-        { "home": 1, "away": 1, "prob": 0.12 }
+        { "home": 2, "away": 1, "prob": 0.14 },
+        { "home": 1, "away": 0, "prob": 0.12 }
       ],
-      "overround": 1.06
+      "overround": 1.06,
+      "qualify": { "home": 0.64, "away": 0.36 }
     }
   ]
 }
 ```
 
-`probabilities` are the de-vigged exchange win/draw/win probabilities; `top_scorelines` is the
-de-vigged probability of each most-likely explicit scoreline (up to 6); `overround` is the raw
-book sum before de-vigging (a measure of the market margin). Fixtures with no correct-score
-market or liquidity are returned with an `error` field instead of a prediction.
+`probabilities` are the de-vigged win/draw/win probabilities (on the 120-minute basis for
+knockouts); `top_scorelines` is the probability of each most-likely explicit scoreline (up to
+6); `overround` is the raw book sum before de-vigging (a measure of the market margin).
+`knockout`/`score_basis` flag whether the 120-minute extra-time model was applied, and
+`qualify` (knockouts only) is each side's de-vigged probability of advancing. For knockouts,
+`superbru_optimal_score` is the recommended (120-minute) pick and `superbru_optimal_score_90min`
+is the naive 90-minute pick, shown alongside so the effect of the extra-time correction is
+visible. Fixtures with no correct-score market or liquidity are returned with an `error` field
+instead of a prediction.
 
 ### `GET /predictions/worldcup/html`
 
 Mobile-friendly HTML view of the same World Cup correct-score predictions. Each match shows a
 home/draw/away probability bar, the most-likely scoreline alongside the SuperBru-optimal pick
-(with expected points), and the top scorelines as chips (the SuperBru pick highlighted). Same
-`limit` query param and same Betfair credential requirements as `/predictions/worldcup`.
+(with expected points), and the top scorelines as chips (the SuperBru pick highlighted).
+Knockout ties are marked with a **`120' · KO`** badge, show each side's qualify probability,
+and display **both** SuperBru picks side by side — `SuperBru · 90'` (naive) and the recommended
+`SuperBru · 120' ✓` (extra-time basis). Same `limit` query param and same Betfair credential
+requirements as `/predictions/worldcup`.
 
 ```
 http://localhost:8000/predictions/worldcup/html?limit=20

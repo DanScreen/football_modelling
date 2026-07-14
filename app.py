@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import html
 import json
+import math
 import os
 import pickle
 import uvicorn
@@ -24,6 +25,18 @@ MODEL_BLOB = os.environ.get('MODEL_BLOB', 'models/pl_model.pkl')
 ARCHIVE_PREFIX = os.environ.get('ARCHIVE_PREFIX', 'predictions/')
 API_KEY = os.environ.get('API_KEY')
 SUPERBRU_MAX_GOALS = 6
+
+# Extra-time model (knockout ties only). SuperBru scores World Cup knockouts on
+# the score after 120 minutes, but Betfair CORRECT_SCORE settles on 90 minutes.
+# For 90-minute draws we play out extra time as independent Poisson goals: the
+# total ET goal rate comes from the correct-score market's implied expected
+# goals scaled to the 30-minute period (with a mild dampening for the lower
+# tempo of extra time), and the home/away split of that rate is calibrated so
+# the resulting win-skew matches the To Qualify market.
+ET_TIME_FRACTION = 30.0 / 90.0
+ET_DAMPENING = 0.9
+ET_MAX_GOALS = 6      # per side, enough for a small-mean Poisson tail
+SCORE_GRID = 9        # matches get_points_matrix dimensions (0..8)
 
 CONVERT_NAMES = {
     'Arsenal': 'Arsenal', 'Aston Villa': 'Aston Villa',
@@ -91,6 +104,125 @@ def _outcome_probs(scorelines, other):
     for (i, j), p in scorelines.items():
         probs[_result_region(i, j)] += p
     return {'home_win': probs['home'], 'draw': probs['draw'], 'away_win': probs['away']}
+
+
+def _poisson_pmf(lam, n):
+    """PMF of a Poisson(lam) for k = 0..n as a list (index k)."""
+    if lam <= 0:
+        return [1.0] + [0.0] * n
+    return [math.exp(-lam) * lam ** k / math.factorial(k) for k in range(n + 1)]
+
+
+def _et_result_probs(lam_h, lam_a):
+    """Given per-side extra-time goal rates, return the probability that the
+    30 minutes of extra time is won by home / won by away / still level, as a
+    (p_home, p_away, p_draw) tuple over independent Poisson goal counts."""
+    ph = _poisson_pmf(lam_h, ET_MAX_GOALS)
+    pa = _poisson_pmf(lam_a, ET_MAX_GOALS)
+    p_home = p_away = p_draw = 0.0
+    for dh, ph_k in enumerate(ph):
+        for da, pa_k in enumerate(pa):
+            joint = ph_k * pa_k
+            if dh > da:
+                p_home += joint
+            elif dh < da:
+                p_away += joint
+            else:
+                p_draw += joint
+    return p_home, p_away, p_draw
+
+
+def _expected_goals(scorelines):
+    mu_home = sum(i * p for (i, j), p in scorelines.items())
+    mu_away = sum(j * p for (i, j), p in scorelines.items())
+    return mu_home, mu_away
+
+
+def _solve_et_home_share(et_total, draw_total, target_draw_skew):
+    """Find the home share s in [0, 1] of the extra-time goal rate such that the
+    net win-skew generated within the drawn 90-minute mass matches
+    target_draw_skew. Monotonic in s, so a bisection converges quickly.
+    Returns s (clamped to [0, 1] if the target is unreachable)."""
+    if et_total <= 0 or draw_total <= 0:
+        return 0.5
+
+    def skew(s):
+        p_home, p_away, _ = _et_result_probs(s * et_total, (1.0 - s) * et_total)
+        return draw_total * (p_home - p_away)
+
+    lo, hi = 0.0, 1.0
+    if target_draw_skew <= skew(lo):
+        return 0.0
+    if target_draw_skew >= skew(hi):
+        return 1.0
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        if skew(mid) < target_draw_skew:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _knockout_120min_distribution(scorelines, other, qualify):
+    """Transform the 90-minute correct-score distribution into the distribution
+    of the score after 120 minutes, which is what SuperBru scores knockouts on.
+
+    Decisive 90-minute scores carry through unchanged; 90-minute draws play out
+    extra time as independent Poisson goals. The total ET goal rate comes from
+    the correct-score market's implied expected goals; the home/away split is
+    calibrated so the resulting win-skew matches the To Qualify market (exact
+    under a 50/50 penalty-shootout assumption). Returns (scorelines_120,
+    other_120) in the same shape as the inputs, ready for the existing optimiser."""
+    mu_home, mu_away = _expected_goals(scorelines)
+    et_total = (mu_home + mu_away) * ET_TIME_FRACTION * ET_DAMPENING
+
+    draws = {(i, j): p for (i, j), p in scorelines.items() if i == j}
+    draw_total = sum(draws.values()) + other.get('draw', 0.0)
+
+    # Decisive 90-minute result skew (fixed — these games end in normal time).
+    h90 = sum(p for (i, j), p in scorelines.items() if i > j) + other.get('home', 0.0)
+    a90 = sum(p for (i, j), p in scorelines.items() if i < j) + other.get('away', 0.0)
+
+    # To Qualify pins the post-120 win-skew: q_home - q_away == W_home - W_away
+    # (the shared 0.5*draw penalty term cancels). Solve for the ET split.
+    q_diff = qualify['home'] - qualify['away']
+    target_draw_skew = q_diff - (h90 - a90)
+    s = _solve_et_home_share(et_total, draw_total, target_draw_skew)
+    lam_h, lam_a = s * et_total, (1.0 - s) * et_total
+
+    scorelines_120 = {}
+    other_120 = {'home': other.get('home', 0.0), 'away': other.get('away', 0.0), 'draw': 0.0}
+
+    # Decisive scores are settled at 90 minutes.
+    for (i, j), p in scorelines.items():
+        if i != j:
+            scorelines_120[(i, j)] = scorelines_120.get((i, j), 0.0) + p
+
+    # Play extra time out over each explicit 90-minute draw.
+    ph = _poisson_pmf(lam_h, ET_MAX_GOALS)
+    pa = _poisson_pmf(lam_a, ET_MAX_GOALS)
+    for (i, _), p in draws.items():
+        for dh, ph_k in enumerate(ph):
+            for da, pa_k in enumerate(pa):
+                prob = p * ph_k * pa_k
+                if prob <= 0:
+                    continue
+                fh, fa = i + dh, i + da
+                if fh < SCORE_GRID and fa < SCORE_GRID:
+                    scorelines_120[(fh, fa)] = scorelines_120.get((fh, fa), 0.0) + prob
+                else:  # overflow the grid — keep it as a result-only bucket
+                    other_120[_result_region(fh, fa)] += prob
+
+    # The 'any other draw' bucket has no explicit score; split it at result level.
+    od = other.get('draw', 0.0)
+    if od > 0:
+        p_home, p_away, p_draw = _et_result_probs(lam_h, lam_a)
+        other_120['home'] += od * p_home
+        other_120['away'] += od * p_away
+        other_120['draw'] += od * p_draw
+
+    return scorelines_120, other_120
 
 
 def _gcs_client():
@@ -241,9 +373,20 @@ def _build_worldcup_betfair(limit: int):
                 'error': 'no correct-score liquidity on Betfair',
             })
             continue
-        ml = max(scorelines, key=scorelines.get) if scorelines else None
-        sb = _superbru_optimal_betfair(scorelines, other)
-        top = sorted(scorelines.items(), key=lambda kv: kv[1], reverse=True)[:6]
+
+        # Knockout ties are scored on the 120-minute score, not the 90-minute
+        # correct-score market. When we have a To Qualify market, remodel the
+        # distribution to include extra time before optimising SuperBru points.
+        knockout = bool(m.get('knockout') and m.get('qualify') and scorelines)
+        if knockout:
+            sb_scorelines, sb_other = _knockout_120min_distribution(
+                scorelines, other, m['qualify'])
+        else:
+            sb_scorelines, sb_other = scorelines, other
+
+        ml = max(sb_scorelines, key=sb_scorelines.get) if sb_scorelines else None
+        sb = _superbru_optimal_betfair(sb_scorelines, sb_other)
+        top = sorted(sb_scorelines.items(), key=lambda kv: kv[1], reverse=True)[:6]
         top_scorelines = [
             {'home': k[0], 'away': k[1], 'prob': round(v, 4)} for k, v in top
         ]
@@ -251,12 +394,22 @@ def _build_worldcup_betfair(limit: int):
             'home_team': home,
             'away_team': away,
             'commence_time': commence,
+            'knockout': knockout,
+            'score_basis': '120min' if knockout else '90min',
             'most_likely_score': {'home': ml[0], 'away': ml[1]} if ml else None,
             'superbru_optimal_score': sb,
-            'probabilities': _outcome_probs(scorelines, other),
+            'probabilities': _outcome_probs(sb_scorelines, sb_other),
             'top_scorelines': top_scorelines,
             'overround': round(m['overround'], 4),
         }
+        if knockout:
+            out['qualify'] = {
+                'home': round(m['qualify']['home'], 4),
+                'away': round(m['qualify']['away'], 4),
+            }
+            # Also expose the naive 90-minute pick alongside the extra-time one,
+            # so the difference the ET correction makes is visible.
+            out['superbru_optimal_score_90min'] = _superbru_optimal_betfair(scorelines, other)
         results.append(out)
     return {'count': len(results), 'matches': results}
 
@@ -452,12 +605,33 @@ def _render_worldcup_html(payload):
                 f"""<i>{s['prob']*100:.0f}%</i></span>"""
             )
         chips_html = ''.join(chips) or '<span class="chip muted">no scoreline liquidity</span>'
-        rows.append(f"""
-        <article class="match">
-          <header><span class="team">{home}</span><span class="vs">v</span><span class="team">{away}</span></header>
-          <p class="kickoff">{kickoff}</p>
-          {_prob_bar(m['probabilities'])}
-          <div class="scores">
+        if m.get('knockout'):
+            q = m.get('qualify', {})
+            badge = (f"""<span class="badge ko" title="Scored on the score after 120 minutes; """
+                     f"""extra time calibrated to the To Qualify market">120' · KO</span>""")
+            kickoff_extra = (f""" · qualify: {home} {q.get('home', 0)*100:.0f}% / """
+                             f"""{away} {q.get('away', 0)*100:.0f}%""") if q else ''
+            # Knockout: show the naive 90' pick next to the recommended 120' pick.
+            sb90 = m.get('superbru_optimal_score_90min', sb)
+            scores_html = f"""
+            <div class="score">
+              <span class="label">Most likely</span>
+              <span class="value">{ml_str}</span>
+            </div>
+            <div class="score muted-pick">
+              <span class="label">SuperBru · 90'</span>
+              <span class="value">{sb90['home']}–{sb90['away']}</span>
+              <span class="ep muted-ep">{sb90['expected_points']:.2f} xPts</span>
+            </div>
+            <div class="score sb">
+              <span class="label">SuperBru · 120' ✓</span>
+              <span class="value">{sb['home']}–{sb['away']}</span>
+              <span class="ep">{sb['expected_points']:.2f} xPts</span>
+            </div>"""
+        else:
+            badge = ''
+            kickoff_extra = ''
+            scores_html = f"""
             <div class="score">
               <span class="label">Most likely</span>
               <span class="value">{ml_str}</span>
@@ -466,7 +640,13 @@ def _render_worldcup_html(payload):
               <span class="label">SuperBru pick</span>
               <span class="value">{sb['home']}–{sb['away']}</span>
               <span class="ep">{sb['expected_points']:.2f} xPts</span>
-            </div>
+            </div>"""
+        rows.append(f"""
+        <article class="match">
+          <header><span class="team">{home}</span><span class="vs">v</span><span class="team">{away}</span>{badge}</header>
+          <p class="kickoff">{kickoff}{kickoff_extra}</p>
+          {_prob_bar(m['probabilities'])}
+          <div class="scores">{scores_html}
           </div>
           <div class="chips">{chips_html}</div>
         </article>""")
@@ -514,10 +694,12 @@ def _render_worldcup_html(payload):
     .score {{ flex: 1; background: var(--card2); border: 1px solid var(--border);
               border-radius: 10px; padding: 10px 12px; }}
     .score.sb {{ border-color: var(--accent); background: linear-gradient(180deg, rgba(74,222,128,0.08), var(--card2)); }}
+    .score.muted-pick {{ opacity: 0.72; }}
     .score .label {{ display: block; font-size: 10px; color: var(--muted); text-transform: uppercase;
                      letter-spacing: 0.6px; }}
     .score .value {{ display: block; font-size: 24px; font-weight: 750; margin-top: 3px; }}
     .score .ep {{ display: block; font-size: 11px; color: var(--accent); margin-top: 3px; font-weight: 600; }}
+    .score .ep.muted-ep {{ color: var(--muted); }}
     .chips {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .chip {{ font-size: 12px; background: var(--card2); border: 1px solid var(--border);
              border-radius: 999px; padding: 4px 10px; color: var(--text); }}
@@ -525,6 +707,10 @@ def _render_worldcup_html(payload):
     .chip.sb {{ border-color: var(--accent); color: var(--accent); }}
     .chip.sb i {{ color: var(--accent); }}
     .chip.muted {{ color: var(--muted); }}
+    .badge {{ flex: 0; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+              padding: 3px 7px; border-radius: 999px; white-space: nowrap; }}
+    .badge.ko {{ color: var(--accent); border: 1px solid var(--accent);
+                 background: rgba(74,222,128,0.08); }}
     .match.unknown {{ opacity: 0.6; }}
     .error {{ color: #fbbf24; font-size: 13px; margin: 6px 0 0; }}
     .meta {{ color: var(--muted); font-size: 13px; }}

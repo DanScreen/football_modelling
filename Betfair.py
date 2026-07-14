@@ -14,6 +14,7 @@ cert is available.
 
 import os
 import re
+import difflib
 import datetime
 import tempfile
 
@@ -153,19 +154,117 @@ def _devig(raw_probs):
     return {k: v / total for k, v in raw_probs.items()}, total
 
 
+def _fetch_to_qualify(query, now_iso, app_key, token, max_markets):
+    """Fetch TO_QUALIFY markets (only present for knockout ties) and return
+    {event_id: {runner_name: devigged_prob}}. The presence of an entry for an
+    event is itself the signal that the tie is a knockout (extra time applies)."""
+    catalogue = _rpc('listMarketCatalogue', {
+        'filter': {
+            'eventTypeIds': [SOCCER_EVENT_TYPE_ID],
+            'textQuery': query,
+            'marketTypeCodes': ['TO_QUALIFY'],
+            'marketStartTime': {'from': now_iso},
+        },
+        'marketProjection': ['EVENT', 'RUNNER_DESCRIPTION'],
+        # Same sort as the correct-score query so both cap the same earliest
+        # events when max_markets bites — otherwise event sets can diverge.
+        'sort': 'FIRST_TO_START',
+        'maxResults': max_markets,
+    }, app_key, token)
+    if not catalogue:
+        return {}
+
+    meta = {}
+    for mkt in catalogue:
+        event_id = mkt.get('event', {}).get('id')
+        if not event_id:
+            continue
+        meta[mkt['marketId']] = {
+            'event_id': event_id,
+            'runners': {r['selectionId']: r['runnerName'] for r in mkt.get('runners', [])},
+        }
+
+    market_ids = list(meta.keys())
+    by_event = {}
+    for i in range(0, len(market_ids), _MARKET_BOOK_BATCH):
+        batch = market_ids[i:i + _MARKET_BOOK_BATCH]
+        result = _rpc('listMarketBook', {
+            'marketIds': batch,
+            'priceProjection': {'priceData': ['EX_BEST_OFFERS']},
+        }, app_key, token)
+        for book in result:
+            info = meta.get(book['marketId'])
+            if not info:
+                continue
+            raw = {}
+            for runner in book.get('runners', []):
+                offers = runner.get('ex', {}).get('availableToBack', [])
+                if not offers:
+                    continue
+                price = offers[0]['price']
+                if not price or price <= 1.0:
+                    continue
+                name = info['runners'].get(runner['selectionId'], '')
+                if name:
+                    raw[name] = raw.get(name, 0.0) + 1.0 / price
+            devigged, _ = _devig(raw)
+            # If an event has more than one TO_QUALIFY market, keep the one with
+            # the most priced runners rather than letting an arbitrary last win.
+            existing = by_event.get(info['event_id'])
+            if devigged and (existing is None or len(devigged) > len(existing)):
+                by_event[info['event_id']] = devigged
+    return by_event
+
+
+def _match_qualify(qualify_runners, home, away):
+    """Map a {runner_name: prob} dict from the To Qualify market onto the
+    home/away teams, tolerating minor name differences between markets."""
+    if not qualify_runners:
+        return None
+    names = list(qualify_runners)
+    if home in qualify_runners and away in qualify_runners:
+        return {'home': qualify_runners[home], 'away': qualify_runners[away]}
+    if len(names) != 2:
+        return None
+    # Pick the runner->team orientation with the best combined name similarity.
+    # Refuse an ambiguous or weak match (return None -> the tie falls back to the
+    # safe 90-minute basis) rather than risk swapping home/away qualify probs.
+    a, b = names
+
+    def sim(x, y):
+        return difflib.SequenceMatcher(None, x.lower(), y.lower()).ratio()
+
+    ab = sim(a, home) + sim(b, away)  # a=home, b=away
+    ba = sim(b, home) + sim(a, away)  # b=home, a=away
+    if max(ab, ba) < 1.0 or abs(ab - ba) < 0.2:
+        return None
+    if ab >= ba:
+        return {'home': qualify_runners[a], 'away': qualify_runners[b]}
+    return {'home': qualify_runners[b], 'away': qualify_runners[a]}
+
+
 def get_worldcup_correct_score(app_key=None, username=None, password=None,
-                               query=None, max_markets=20):
+                               query=None, max_markets=20, include_qualify=True):
     """Fetch upcoming FIFA World Cup CORRECT_SCORE markets and return, per match,
     the de-vigged probability of each explicit scoreline plus the 'any other
     home/draw/away win' buckets.
 
+    CORRECT_SCORE settles on 90 minutes only. When include_qualify is set we also
+    pull the TO_QUALIFY market (present only for knockout ties) in the same
+    session; its presence flags the tie as a knockout, and its de-vigged prices
+    give each side's probability of advancing (after extra time and penalties),
+    used downstream to build the 120-minute score distribution SuperBru scores on.
+
     Returns a list of dicts:
         {
           'match': [home, away],
+          'event_id': str,
           'time': datetime,
-          'scorelines': {(home, away): prob, ...},   # explicit, de-vigged
-          'other': {'home': p, 'draw': p, 'away': p}, # de-vigged buckets
+          'scorelines': {(home, away): prob, ...},   # explicit, de-vigged, 90 min
+          'other': {'home': p, 'draw': p, 'away': p}, # de-vigged buckets, 90 min
           'overround': float,                          # pre-de-vig book sum
+          'knockout': bool,                            # TO_QUALIFY market exists
+          'qualify': {'home': p, 'away': p} | None,    # de-vigged, incl. ET + pens
         }
     """
     app_key = app_key or os.environ.get('BETFAIR_APP_KEY')
@@ -207,6 +306,7 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
         else:
             home, away = event_name, ''
         meta[market_id] = {
+            'event_id': event.get('id'),
             'home': home.strip(),
             'away': away.strip(),
             'time': _parse_time(event.get('openDate') or mkt.get('marketStartTime')),
@@ -261,11 +361,32 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
 
         matches.append({
             'match': [info['home'], info['away']],
+            'event_id': info.get('event_id'),
             'time': info['time'],
             'scorelines': scorelines,
             'other': other,
             'overround': overround,
+            'knockout': False,
+            'qualify': None,
         })
+
+    if include_qualify:
+        # Qualify data is an optional enrichment: a failure here (including a
+        # network/timeout error, which is not a BetfairError) must never take
+        # down the core correct-score response, so degrade to no knockout data.
+        try:
+            qualify_by_event = _fetch_to_qualify(query, now_iso, app_key, token, max_markets)
+        except Exception as e:
+            print(f'To Qualify fetch failed, continuing without knockout data: {e}')
+            qualify_by_event = {}
+        for m in matches:
+            runners = qualify_by_event.get(m['event_id'])
+            if not runners:
+                continue
+            mapped = _match_qualify(runners, m['match'][0], m['match'][1])
+            if mapped:
+                m['knockout'] = True
+                m['qualify'] = mapped
 
     matches.sort(key=lambda m: (m['time'] or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)))
     return matches
