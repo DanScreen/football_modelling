@@ -131,6 +131,38 @@ resource "google_secret_manager_secret" "betfair_key" {
   depends_on = [google_project_service.apis]
 }
 
+# Scorers (scorersonline.uk) bot API keys - one per account, so the model and
+# the Betfair market each play the league as their own player. Values are set
+# out of band once the two bot accounts exist; the API returns 503 for a stream
+# whose key is still empty, so the infra can land ahead of the accounts.
+resource "google_secret_manager_secret" "scorers_model_api_key" {
+  secret_id = "scorers-model-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "scorers_betfair_api_key" {
+  secret_id = "scorers-betfair-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_iam_member" "run_scorers_model" {
+  secret_id = google_secret_manager_secret.scorers_model_api_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_scorers_betfair" {
+  secret_id = google_secret_manager_secret.scorers_betfair_api_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "run_odds" {
   secret_id = google_secret_manager_secret.odds_api_key.id
   role      = "roles/secretmanager.secretAccessor"
@@ -290,6 +322,26 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
       env {
+        name = "SCORERS_MODEL_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.scorers_model_api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "SCORERS_BETFAIR_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.scorers_betfair_api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
         name = "BETFAIR_KEY"
         value_source {
           secret_key_ref {
@@ -347,6 +399,39 @@ resource "google_cloud_scheduler_job" "daily_retrain" {
   http_target {
     http_method = "POST"
     uri         = "${google_cloud_run_v2_service.api.uri}/model/refresh"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# One job per stream rather than one job submitting both: a Betfair outage
+# must not stop the model playing, and the two rows on the leaderboard should
+# fail independently.
+resource "google_cloud_scheduler_job" "daily_submit" {
+  for_each = toset(["model", "betfair"])
+
+  name      = "football-daily-submit-${each.key}"
+  schedule  = var.submit_cron
+  time_zone = var.schedule_tz
+  region    = var.region
+
+  attempt_deadline = "300s"
+  # Submissions are idempotent (Scorers overwrites on repeat POSTs), so a retry
+  # is safe and worth having - a missed deadline means no picks that round.
+  retry_config {
+    retry_count = 2
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.api.uri}/submissions/scorers?stream=${each.key}&limit=20"
     headers = {
       "Content-Type" = "application/json"
     }

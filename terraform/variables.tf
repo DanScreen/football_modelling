@@ -36,6 +36,12 @@ variable "schedule_cron" {
   description = "Cron expression for daily archive job (default 08:00 daily)"
 }
 
+variable "submit_cron" {
+  description = "Cron for submitting predictions to Scorers (after the retrain and archive)"
+  type        = string
+  default     = "30 8 * * *"
+}
+
 variable "retrain_cron" {
   type        = string
   default     = "0 7 * * *"

@@ -19,6 +19,7 @@ Each match prediction returns **two** scorelines:
 | `Helper.py` | Core Bayesian model classes (`league`, `league_fast`) and CSV parsers |
 | `get_data.py` | Download match/betting CSVs (`fetch_csv`, `download_match_data`, `download_betting_data`) |
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
+| `Scorers.py` | Client for the [Scorers](https://scorersonline.uk) bot API — fixture matching and prediction submission |
 | `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` (and knockout `TO_QUALIFY`) odds for World Cup and Premier League fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
 | `AutoData/`, `BettingData/` | Downloaded CSVs, named `<season-end-year><league>.csv` (created on first data download) |
@@ -50,7 +51,7 @@ Environment variables:
 | `GCS_BUCKET` | _(unset)_ | If set, model is loaded/saved from this bucket and predictions are archived there |
 | `MODEL_BLOB` | `models/pl_model.pkl` | GCS object path for the model pickle |
 | `ARCHIVE_PREFIX` | `predictions/` | GCS prefix for daily prediction archive (key is `<prefix><YYYY-MM-DD>.json`) |
-| `API_KEY` | _(unset, auth disabled)_ | If set, `/train`, `/model/refresh` and `/predictions/archive` require `X-API-Key: <value>` |
+| `API_KEY` | _(unset, auth disabled)_ | If set, `/train`, `/model/refresh`, `/predictions/archive` and `/submissions/scorers` require `X-API-Key: <value>` |
 | `OIDC_SERVICE_ACCOUNT` | _(unset)_ | Service account allowed to call the protected endpoints with a Google OIDC token instead of the API key. Set by Terraform to the scheduler SA |
 | `OIDC_AUDIENCE` | _(unset, audience not checked)_ | Audience the OIDC token must carry |
 | `MODEL_REFRESH_TTL` | `60` | Seconds between checks for a newer model in GCS (see [Model freshness](#model-freshness)) |
@@ -63,6 +64,10 @@ Environment variables:
 | `BETFAIR_CERT` / `BETFAIR_KEY` | _(unset)_ | PEM **contents** of the client cert/key (used on Cloud Run, injected as secrets) |
 | `BETFAIR_WC_QUERY` | `FIFA World Cup` | Text query used to locate the World Cup competition on the exchange |
 | `BETFAIR_PL_QUERY` | `English Premier League` | Text query used to locate the Premier League competition on the exchange |
+| `SCORERS_MODEL_API_KEY` | _(unset, stream disabled)_ | API key of the Scorers account the **model** plays as |
+| `SCORERS_BETFAIR_API_KEY` | _(unset, stream disabled)_ | API key of the Scorers account the **Betfair market** plays as |
+| `SCORERS_BASE_URL` | `https://scorersonline.uk` | Scorers instance to submit to |
+| `SCORERS_LEAGUE_ID` | _(unset, oldest membership)_ | Scope submissions to a specific Scorers league |
 | `PORT` | `8000` (`8080` in container) | Port uvicorn listens on |
 
 ## Running the API
@@ -514,6 +519,93 @@ market or liquidity come back with an `error` field instead of prices.
 
 ---
 
+### `POST /submissions/scorers`
+
+Submits predictions to [Scorers](https://scorersonline.uk), which exposes a public bot API
+(`/api/v1/`) so automated models can play a league alongside humans.
+
+```
+POST /submissions/scorers?stream=model|betfair&limit=20&dry_run=false
+```
+
+| Param | Meaning |
+|---|---|
+| `stream` | `model` plays the Bayesian model's picks; `betfair` plays the de-vigged exchange prices |
+| `limit` | How many upcoming fixtures to consider |
+| `dry_run` | Match fixtures and choose picks, but send nothing. Returns the same body with `dry_run: true` |
+
+Requires the same caller auth as `/train` (OIDC or `X-API-Key`).
+
+#### Two accounts, not one
+
+Scorers authenticates with a bearer key that maps to exactly one user, and has **no
+impersonation or delegation mechanism** — whoever holds the key *is* that player. So each
+stream is a **separate Scorers account holding its own key**: `SCORERS_MODEL_API_KEY` and
+`SCORERS_BETFAIR_API_KEY`. That's also the shape you want, since it puts the model and the
+market on the leaderboard as two independent players competing head to head over a season.
+
+Both accounts must be registered on Scorers, flagged as bots, and joined to the **same
+league**. Fixtures are canonical per competition, so both then see identical `fixtureId`s.
+A stream whose key is unset returns `503` and is simply skipped — the infrastructure can be
+deployed before the accounts exist.
+
+#### Fixture matching
+
+Team names arrive in four vocabularies: football-data.co.uk (the model), Betfair
+(`Man Utd`), football-data.org `shortName` (what Scorers imports), and occasionally full
+club names. Rather than a fourth mapping table, `Scorers.match_fixture()` matches on
+**kickoff time plus fuzzy name similarity** over a canonical form, and requires *each* side
+to clear a floor independently — that per-side check is what stops `Man United` matching a
+`Man City` fixture on the strength of a perfect match on the other team. An unconfident
+match is **skipped, not guessed**, and reported under `skipped`.
+
+#### Bankers
+
+Scorers doubles the points from one pick per round, with a floor of zero — so it is
+upside-only, and *not* setting a banker forfeits points. Each stream bankers its own
+highest expected-points fixture in each round.
+
+Submission runs in **two passes**: the first sends scores with `isBanker` omitted (which
+leaves any existing banker untouched), and the second sets the banker. Separating them
+matters because Scorers saves the prediction *before* applying the banker, so a `422` from
+a locked banker in a single-pass request would obscure a score that did in fact save. A
+refused banker is reported with `ok: false` and never fails the run.
+
+Submissions are idempotent — Scorers overwrites on repeat POSTs — so re-running is safe,
+and picks sharpen as prices firm up nearer kickoff.
+
+```json
+{
+  "stream": "betfair",
+  "dry_run": false,
+  "open_fixtures": 10,
+  "picks": 10,
+  "counts": { "submitted": 10, "skipped": 0, "failed": 0 },
+  "submitted": [
+    {
+      "fixture_id": "clx…",
+      "round": "Matchweek 1",
+      "scorers_fixture": "Arsenal v Coventry City",
+      "our_fixture": "Arsenal v Coventry",
+      "score": { "home": 2, "away": 0 },
+      "expected_points": 1.2686
+    }
+  ],
+  "bankers": [
+    { "round": "Matchweek 1", "fixture_id": "clx…", "fixture": "Arsenal v Coventry City",
+      "expected_points": 1.2686, "ok": true }
+  ],
+  "skipped": [],
+  "failed": []
+}
+```
+
+> Scorers scores 3 / 1.5 / 1 / 0 with the goal-difference-preserving "close" rule — the
+> same rule `get_points_matrix` encodes here — so `superbru_optimal_score` is already
+> optimising the site's exact scoring function. No adaptation needed.
+
+---
+
 ## Typical workflow
 
 1. Start the server: `uvicorn app:app --reload`
@@ -619,15 +711,18 @@ and roll out a new Cloud Run revision.
 2. **08:00** Cloud Scheduler fires → `POST /predictions/archive`. Running an hour after the
    retrain means the day's archived predictions come from a model trained on the freshest
    available data.
-3. Cloud Run loads the pickled model from GCS (or reuses the warm instance, pulling a newer
+3. **08:30** Two more jobs fire → `POST /submissions/scorers?stream=model` and
+   `?stream=betfair`, sending each stream's picks to [Scorers](https://scorersonline.uk).
+   Separate jobs so a Betfair outage can't stop the model playing.
+4. Cloud Run loads the pickled model from GCS (or reuses the warm instance, pulling a newer
    model if one has appeared — see [Model freshness](#model-freshness)), calls the odds API
    for upcoming fixtures, computes predictions, and writes
    `gs://<bucket>/predictions/<YYYY-MM-DD>.json`.
-4. Whenever you want to view, open the bookmark on your iPhone:
+5. Whenever you want to view, open the bookmark on your iPhone:
    `https://<service-url>/predictions/today` — renders the latest fixtures as a mobile
    page with most-likely and SuperBru-optimal scorelines.
 
-Both scheduler jobs authenticate with **OIDC tokens** minted for the
+All four scheduler jobs authenticate with **OIDC tokens** minted for the
 `football-scheduler` service account, not a shared secret — there's no API key to populate
 by hand and nothing for `terraform apply` to reset. The app verifies the token itself
 (`OIDC_SERVICE_ACCOUNT` / `OIDC_AUDIENCE`) because the service has to stay publicly

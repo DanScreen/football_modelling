@@ -21,6 +21,7 @@ from Helper import league, get_points_matrix
 from Get_Odds import get_odds
 from Betfair import (get_worldcup_correct_score,
                      get_premier_league_correct_score, BetfairError)
+from Scorers import ScorersClient, ScorersError, match_fixture
 from get_data import download_match_data
 
 MODEL_PATH = os.environ.get('MODEL_PATH', 'pl_model.pkl')
@@ -42,6 +43,15 @@ DATA_STATE_BLOB = os.environ.get('DATA_STATE_BLOB', 'state/data_fingerprint.json
 DATA_STATE_PATH = os.environ.get('DATA_STATE_PATH', '.data_fingerprint.json')
 
 FOOTBALL_DATA_URL = 'https://www.football-data.co.uk/mmz4281/'
+
+# Scorers (scorersonline.uk) submission streams. Each stream is a separate
+# account on the site holding its own API key, so the model and the market get
+# independent leaderboard rows - the site has no notion of acting "on behalf
+# of" another user, and two accounts is the shape that gives.
+SCORERS_STREAMS = {
+    'model': 'SCORERS_MODEL_API_KEY',
+    'betfair': 'SCORERS_BETFAIR_API_KEY',
+}
 TRAIN_START_SEASON = 1996
 DATA_LEAGUES = ('E0', 'E1', 'E2')   # E2 identifies the promoted sides - see start_next_season
 
@@ -723,6 +733,127 @@ def _build_premier_league_odds(limit: int):
     }
 
 
+def _scorers_picks(stream, limit):
+    """The picks a stream wants to submit, as (home, away, kickoff, pick) rows.
+
+    Both builders already expose `superbru_optimal_score` computed against the
+    same points matrix Scorers scores with (3 / 1.5 / 1 / 0, GD-preserving
+    close), so no re-optimisation is needed here."""
+    if stream == 'model':
+        payload = _build_upcoming(limit)
+    else:
+        payload = _build_premier_league_odds(limit)
+    rows = []
+    for m in payload['matches']:
+        pick = m.get('superbru_optimal_score')
+        if m.get('error') or not pick:
+            continue
+        rows.append({
+            'home_team': m['home_team'],
+            'away_team': m['away_team'],
+            'commence_time': m.get('commence_time'),
+            'home': pick['home'],
+            'away': pick['away'],
+            'expected_points': pick.get('expected_points', 0.0),
+        })
+    return rows
+
+
+def _submit_to_scorers(stream, limit, dry_run=False):
+    """Submit one stream's picks to Scorers under that stream's own API key.
+
+    Two passes on purpose. The scores pass omits `isBanker` entirely, so it can
+    never disturb a banker already set; the banker pass then sets one per round
+    on the highest expected-points fixture. Doing it in one pass would risk the
+    site's 422 on a locked banker masking an otherwise successful score
+    submission, since the prediction is saved before the banker is applied."""
+    env_var = SCORERS_STREAMS.get(stream)
+    if env_var is None:
+        raise HTTPException(400, f"Unknown stream '{stream}'. Expected one of {sorted(SCORERS_STREAMS)}")
+    api_key = os.environ.get(env_var)
+    if not api_key:
+        raise HTTPException(503, f'{env_var} is not configured - no Scorers account for the {stream} stream yet')
+
+    picks = _scorers_picks(stream, limit)
+    try:
+        client = ScorersClient(api_key)
+        fixtures = client.open_fixtures()
+    except ScorersError as e:
+        raise HTTPException(502, f'Scorers error: {e}')
+
+    submitted, skipped, failed = [], [], []
+    matched = []
+    for p in picks:
+        fx = match_fixture(fixtures, p['home_team'], p['away_team'], p['commence_time'])
+        if fx is None:
+            # No confident match - skipping beats guessing, which would submit
+            # this pick against somebody else's fixture.
+            skipped.append({'home_team': p['home_team'], 'away_team': p['away_team'],
+                            'reason': 'no confident fixture match on Scorers'})
+            continue
+        matched.append((p, fx))
+
+    for p, fx in matched:
+        entry = {
+            'fixture_id': fx['id'],
+            'round': fx.get('round'),
+            'scorers_fixture': f"{fx.get('homeTeam')} v {fx.get('awayTeam')}",
+            'our_fixture': f"{p['home_team']} v {p['away_team']}",
+            'score': {'home': p['home'], 'away': p['away']},
+            'expected_points': round(p['expected_points'], 4),
+        }
+        if dry_run:
+            submitted.append({**entry, 'dry_run': True})
+            continue
+        try:
+            res = client.submit(fx['id'], p['home'], p['away'])
+        except ScorersError as e:
+            raise HTTPException(502, f'Scorers error: {e}')
+        if res['ok']:
+            submitted.append(entry)
+        else:
+            failed.append({**entry, 'status': res['status'], 'error': res['error']})
+
+    # One banker per round, on the pick we expect most from. It is upside-only
+    # (minimum score 0, doubled), so not setting one simply forfeits points.
+    bankers = {}
+    for p, fx in matched:
+        rnd = fx.get('round')
+        if rnd is None:
+            continue
+        if rnd not in bankers or p['expected_points'] > bankers[rnd][0]['expected_points']:
+            bankers[rnd] = (p, fx)
+
+    banker_results = []
+    for rnd, (p, fx) in sorted(bankers.items()):
+        entry = {'round': rnd, 'fixture_id': fx['id'],
+                 'fixture': f"{fx.get('homeTeam')} v {fx.get('awayTeam')}",
+                 'expected_points': round(p['expected_points'], 4)}
+        if dry_run:
+            banker_results.append({**entry, 'dry_run': True})
+            continue
+        try:
+            res = client.submit(fx['id'], p['home'], p['away'], is_banker=True)
+        except ScorersError as e:
+            raise HTTPException(502, f'Scorers error: {e}')
+        # A locked banker (the round already has one on a kicked-off match) is
+        # an expected outcome, not a failure of the run - the score still stands.
+        banker_results.append({**entry, 'ok': res['ok'],
+                               **({} if res['ok'] else {'error': res['error']})})
+
+    return {
+        'stream': stream,
+        'dry_run': dry_run,
+        'open_fixtures': len(fixtures),
+        'picks': len(picks),
+        'submitted': submitted,
+        'bankers': banker_results,
+        'skipped': skipped,
+        'failed': failed,
+        'counts': {'submitted': len(submitted), 'skipped': len(skipped), 'failed': len(failed)},
+    }
+
+
 @app.get('/health')
 def health():
     return {
@@ -807,6 +938,21 @@ def upcoming(limit: int = 20):
 @app.get('/predictions/worldcup')
 def worldcup(limit: int = 20):
     return _build_worldcup_betfair(limit)
+
+
+@app.post('/submissions/scorers')
+def submit_scorers(stream: str = Query(..., pattern='^(model|betfair)$'),
+                   limit: int = Query(default=20),
+                   dry_run: bool = Query(default=False),
+                   x_api_key: Optional[str] = Header(default=None),
+                   authorization: Optional[str] = Header(default=None)):
+    """Submit a stream's picks to Scorers under that stream's own account.
+
+    `stream=model` plays the Bayesian model; `stream=betfair` plays the
+    de-vigged exchange prices. Idempotent - Scorers overwrites on repeat POSTs,
+    so re-running is safe and picks sharpen as kickoff approaches."""
+    _require_caller(x_api_key, authorization)
+    return _submit_to_scorers(stream, limit, dry_run=dry_run)
 
 
 @app.get('/odds/premierleague')
