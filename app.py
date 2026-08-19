@@ -43,8 +43,9 @@ CONVERT_NAMES = {
     'AFC Bournemouth': 'Bournemouth', 'Bournemouth': 'Bournemouth',
     'Brentford': 'Brentford', 'Brighton and Hove Albion': 'Brighton',
     'Burnley': 'Burnley', 'Chelsea': 'Chelsea',
-    'Crystal Palace': 'Crystal Palace', 'Everton': 'Everton',
-    'Fulham': 'Fulham', 'Ipswich Town': 'Ipswich',
+    'Coventry City': 'Coventry', 'Crystal Palace': 'Crystal Palace',
+    'Everton': 'Everton', 'Fulham': 'Fulham',
+    'Hull City': 'Hull', 'Ipswich Town': 'Ipswich',
     'Leeds United': 'Leeds', 'Leicester City': 'Leicester',
     'Liverpool': 'Liverpool', 'Luton Town': 'Luton',
     'Manchester City': 'Man City', 'Manchester United': 'Man United',
@@ -423,15 +424,30 @@ def health():
 def train(req: TrainRequest, x_api_key: Optional[str] = Header(default=None)):
     _require_api_key(x_api_key)
     if req.download_data:
-        download_match_data(year_range=range(1996, 2027), leagues=['E0', 'E1'])
-    seasons = req.seasons or list(range(1996, 2027))
+        # E2 as well as E0/E1: it's what identifies the promoted sides when the
+        # new Premier League file hasn't been published yet (see start_next_season).
+        download_match_data(year_range=range(1996, 2028), leagues=['E0', 'E1', 'E2'])
+    seasons = req.seasons or list(range(1996, 2028))
     PL = league()
     PL.train_all(league_str='E0', league_below='E1', SEA=seasons)
+    trained = list(getattr(PL, 'seasons_trained', None) or seasons)
+
+    # Seasons with no E0 file yet were skipped. If the newest one has already
+    # started in the divisions below, roll the model into it so the promoted
+    # sides are predictable before the first Premier League results land.
+    rolled = None
+    pending = [s for s in seasons if s > max(trained)]
+    if pending:
+        rolled = PL.start_next_season(min(pending))
+
     state['model'] = PL
     _save_model(PL)
     return {
         'status': 'trained',
-        'seasons': seasons,
+        'seasons': trained,
+        'seasons_requested': seasons,
+        'rolled_forward_to': getattr(PL, 'rolled_forward_to', None),
+        'season_changes': {'out': rolled[0], 'in': rolled[1]} if rolled else None,
         'teams': list(PL.teams),
         'model_path': MODEL_PATH,
         'gcs_uri': f'gs://{GCS_BUCKET}/{MODEL_BLOB}' if GCS_BUCKET else None,

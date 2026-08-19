@@ -21,7 +21,7 @@ Each match prediction returns **two** scorelines:
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
 | `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` (and knockout `TO_QUALIFY`) odds for World Cup fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
-| `AutoData/`, `BettingData/` | Downloaded CSVs (created on first data download) |
+| `AutoData/`, `BettingData/` | Downloaded CSVs, named `<season-end-year><league>.csv` (created on first data download) |
 | `pl_model.pkl` | Pickled trained model (created on first `/train`) |
 | `Dockerfile` / `.dockerignore` | Container build for Cloud Run |
 | `requirements.txt` | Pinned Python deps for the container |
@@ -100,10 +100,44 @@ Request body:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `download_data` | bool | `false` | If true, download fresh `E0`/`E1` CSVs into `AutoData/` before training |
-| `seasons` | list[int] \| null | `null` | Season end-years to train on. Defaults to `1996…2026` |
+| `download_data` | bool | `false` | If true, download fresh `E0`/`E1`/`E2` CSVs into `AutoData/` before training |
+| `seasons` | list[int] \| null | `null` | Season end-years to train on. Defaults to `1996…2027` |
 
-Response: `{ "status": "trained", "seasons": [...], "teams": [...], "model_path": "pl_model.pkl" }`
+Seasons are named by the year they *end* in, so `2027` is the 2026/27 season.
+
+**Missing seasons are skipped, not fatal.** football-data.co.uk publishes a division's CSV
+only once that division kicks off, so a range that runs to the current season will reference
+files that don't exist yet. Training uses whatever is on disk and lists the seasons it
+actually used in `seasons` (the requested range is echoed back as `seasons_requested`). It
+only fails if *no* season files are found at all.
+
+**Rolling into a season before its fixtures are published.** The Premier League file lands a
+week or two after the EFL's, leaving a window each August where the new season has started
+but there are no top-flight matches to train on. When the newest requested season has no
+`E0` file, `/train` calls `league.start_next_season`, which infers the new line-up from the
+divisions below — relegated sides show up in `E1`, and the promoted sides are the ones
+missing from both `E1` and `E2` — then applies the promoted/relegated priors. This is why
+`E2` is downloaded alongside `E0`/`E1`. The promoted clubs are therefore predictable from day
+one instead of erroring as unknown teams. If the feeder data isn't available either, or the
+inferred swap isn't balanced, the roll-forward is skipped and the model stays on the last
+completed season.
+
+Response:
+
+```json
+{
+  "status": "trained",
+  "seasons": [1996, "…", 2026],
+  "seasons_requested": [1996, "…", 2027],
+  "rolled_forward_to": 2027,
+  "season_changes": { "out": ["Burnley", "West Ham", "Wolves"], "in": ["Coventry", "Hull", "Ipswich"] },
+  "teams": ["Arsenal", "…"],
+  "model_path": "pl_model.pkl",
+  "gcs_uri": null
+}
+```
+
+`rolled_forward_to` and `season_changes` are `null` when no roll-forward was applied.
 
 Example:
 
@@ -334,6 +368,9 @@ http://localhost:8000/predictions/worldcup/html?limit=20
 2. First-time setup: `POST /train` with `{"download_data": true}` to download CSVs and train.
 3. Subsequent restarts auto-load `pl_model.pkl` — no retraining needed unless you want fresh data.
 4. Hit `GET /predictions/upcoming` for fixture-by-fixture predictions.
+5. Each August, re-run `POST /train` with `{"download_data": true}` to pick up the new season.
+   Run it again once football-data.co.uk publishes that season's `E0` file, so the model
+   trains on real results rather than sitting on the promoted/relegated priors alone.
 
 ## Deployment to GCP Cloud Run
 

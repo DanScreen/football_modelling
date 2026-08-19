@@ -15,7 +15,7 @@ def fetch_csv(url, encoding='latin-1'):
     return pd.read_csv(io.BytesIO(r.content.lstrip(b'\xef\xbb\xbf')), encoding=encoding)
 
 
-def download_match_data(year_range=range(1996, 2027), leagues=None, output_dir='AutoData'):
+def download_match_data(year_range=range(1996, 2028), leagues=None, output_dir='AutoData'):
     if leagues is None:
         leagues = ['E0']
     if not os.path.exists(output_dir):
