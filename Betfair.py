@@ -243,22 +243,25 @@ def _match_qualify(qualify_runners, home, away):
     return {'home': qualify_runners[b], 'away': qualify_runners[a]}
 
 
-def get_worldcup_correct_score(app_key=None, username=None, password=None,
-                               query=None, max_markets=20, include_qualify=True):
-    """Fetch upcoming FIFA World Cup CORRECT_SCORE markets and return, per match,
-    the de-vigged probability of each explicit scoreline plus the 'any other
-    home/draw/away win' buckets.
+def get_correct_score(query, app_key=None, username=None, password=None,
+                      max_markets=20, include_qualify=False):
+    """Fetch upcoming CORRECT_SCORE markets matching `query` (a Betfair text
+    query, typically a competition name) and return, per match, the de-vigged
+    probability of each explicit scoreline plus the 'any other home/draw/away
+    win' buckets.
 
     CORRECT_SCORE settles on 90 minutes only. When include_qualify is set we also
     pull the TO_QUALIFY market (present only for knockout ties) in the same
     session; its presence flags the tie as a knockout, and its de-vigged prices
     give each side's probability of advancing (after extra time and penalties),
     used downstream to build the 120-minute score distribution SuperBru scores on.
+    League fixtures have no such market, so leave it off for those.
 
     Returns a list of dicts:
         {
           'match': [home, away],
           'event_id': str,
+          'competition': str,                          # as Betfair names it
           'time': datetime,
           'scorelines': {(home, away): prob, ...},   # explicit, de-vigged, 90 min
           'other': {'home': p, 'draw': p, 'away': p}, # de-vigged buckets, 90 min
@@ -270,7 +273,6 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
     app_key = app_key or os.environ.get('BETFAIR_APP_KEY')
     username = username or os.environ.get('BETFAIR_USERNAME')
     password = password or os.environ.get('BETFAIR_PASSWORD')
-    query = query or os.environ.get('BETFAIR_WC_QUERY', 'FIFA World Cup')
     if not (app_key and username and password):
         raise BetfairError('BETFAIR_APP_KEY, BETFAIR_USERNAME and BETFAIR_PASSWORD must be set')
 
@@ -284,7 +286,7 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
             'marketTypeCodes': ['CORRECT_SCORE'],
             'marketStartTime': {'from': now_iso},
         },
-        'marketProjection': ['EVENT', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME'],
+        'marketProjection': ['EVENT', 'COMPETITION', 'RUNNER_DESCRIPTION', 'MARKET_START_TIME'],
         'sort': 'FIRST_TO_START',
         'maxResults': max_markets,
     }, app_key, token)
@@ -307,6 +309,7 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
             home, away = event_name, ''
         meta[market_id] = {
             'event_id': event.get('id'),
+            'competition': mkt.get('competition', {}).get('name'),
             'home': home.strip(),
             'away': away.strip(),
             'time': _parse_time(event.get('openDate') or mkt.get('marketStartTime')),
@@ -362,6 +365,7 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
         matches.append({
             'match': [info['home'], info['away']],
             'event_id': info.get('event_id'),
+            'competition': info.get('competition'),
             'time': info['time'],
             'scorelines': scorelines,
             'other': other,
@@ -390,3 +394,25 @@ def get_worldcup_correct_score(app_key=None, username=None, password=None,
 
     matches.sort(key=lambda m: (m['time'] or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)))
     return matches
+
+
+def get_worldcup_correct_score(app_key=None, username=None, password=None,
+                               query=None, max_markets=20, include_qualify=True):
+    """World Cup correct-score markets. Knockout ties carry a TO_QUALIFY market,
+    so qualify data is pulled by default."""
+    return get_correct_score(
+        query or os.environ.get('BETFAIR_WC_QUERY', 'FIFA World Cup'),
+        app_key=app_key, username=username, password=password,
+        max_markets=max_markets, include_qualify=include_qualify,
+    )
+
+
+def get_premier_league_correct_score(app_key=None, username=None, password=None,
+                                     query=None, max_markets=20):
+    """Premier League correct-score markets. League fixtures are decided on 90
+    minutes and have no TO_QUALIFY market, so no qualify lookup is made."""
+    return get_correct_score(
+        query or os.environ.get('BETFAIR_PL_QUERY', 'English Premier League'),
+        app_key=app_key, username=username, password=password,
+        max_markets=max_markets, include_qualify=False,
+    )

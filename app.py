@@ -19,7 +19,8 @@ from pydantic import BaseModel
 
 from Helper import league, get_points_matrix
 from Get_Odds import get_odds
-from Betfair import get_worldcup_correct_score, BetfairError
+from Betfair import (get_worldcup_correct_score,
+                     get_premier_league_correct_score, BetfairError)
 from get_data import download_match_data
 
 MODEL_PATH = os.environ.get('MODEL_PATH', 'pl_model.pkl')
@@ -74,6 +75,21 @@ CONVERT_NAMES = {
     'Sunderland': 'Sunderland', 'Tottenham Hotspur': 'Tottenham',
     'West Bromwich Albion': 'West Brom', 'West Ham United': 'West Ham',
     'Wolverhampton Wanderers': 'Wolves',
+}
+
+# Betfair's own short names, where they differ from the football-data.co.uk
+# names the rest of the app uses. Only the mismatches need listing - most of
+# Betfair's names already agree.
+BETFAIR_NAMES = {
+    'Man Utd': 'Man United',
+    'Nottm Forest': "Nott'm Forest",
+    'Nottingham Forest': "Nott'm Forest",
+    'Spurs': 'Tottenham',
+    'Sheff Utd': 'Sheffield United',
+    'Sheff Wed': 'Sheffield Weds',
+    'Wolverhampton': 'Wolves',
+    'Brighton & Hove Albion': 'Brighton',
+    'Newcastle Utd': 'Newcastle',
 }
 
 state = {
@@ -640,6 +656,73 @@ def _build_worldcup_betfair(limit: int):
     return {'count': len(results), 'matches': results}
 
 
+def _normalise_betfair_team(name):
+    """Map a Betfair team name onto the football-data.co.uk name the model uses,
+    so odds can be cross-referenced with /predictions/upcoming. Unknown names
+    pass through unchanged - this endpoint reports the market, and does not need
+    the model to have heard of the team."""
+    if name in BETFAIR_NAMES:
+        return BETFAIR_NAMES[name]
+    if name in CONVERT_NAMES:
+        return CONVERT_NAMES[name]
+    return name
+
+
+def _build_premier_league_odds(limit: int):
+    """Upcoming Premier League fixtures priced straight off the Betfair exchange.
+
+    Deliberately independent of the trained model: nothing here reads `state`,
+    and no Poisson assumption is made. Every number is the de-vigged market
+    price. League games settle on 90 minutes, so there is no extra-time
+    correction to apply either."""
+    try:
+        matches = get_premier_league_correct_score(max_markets=limit)
+    except BetfairError as e:
+        raise HTTPException(502, f'Betfair error: {e}')
+    if not matches:
+        raise HTTPException(502, 'No Premier League correct-score markets available on Betfair.')
+
+    results = []
+    for m in matches[:limit]:
+        home, away = m['match']
+        scorelines = m['scorelines']
+        other = m['other']
+        commence = m['time'].isoformat() if m['time'] else None
+        entry = {
+            'home_team': _normalise_betfair_team(home),
+            'away_team': _normalise_betfair_team(away),
+            'betfair_home_team': home,
+            'betfair_away_team': away,
+            'competition': m.get('competition'),
+            'commence_time': commence,
+        }
+        if not scorelines and not any(other.values()):
+            entry['error'] = 'no correct-score liquidity on Betfair'
+            results.append(entry)
+            continue
+
+        ml = max(scorelines, key=scorelines.get) if scorelines else None
+        top = sorted(scorelines.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        entry.update({
+            'most_likely_score': {'home': ml[0], 'away': ml[1]} if ml else None,
+            'probabilities': _outcome_probs(scorelines, other),
+            'top_scorelines': [
+                {'home': k[0], 'away': k[1], 'prob': round(v, 4)} for k, v in top
+            ],
+            'other_scorelines': {k: round(v, 4) for k, v in other.items()},
+            'superbru_optimal_score': _superbru_optimal_betfair(scorelines, other),
+            'overround': round(m['overround'], 4),
+        })
+        results.append(entry)
+    return {
+        'source': 'betfair',
+        'market': 'CORRECT_SCORE',
+        'score_basis': '90min',
+        'count': len(results),
+        'matches': results,
+    }
+
+
 @app.get('/health')
 def health():
     return {
@@ -724,6 +807,15 @@ def upcoming(limit: int = 20):
 @app.get('/predictions/worldcup')
 def worldcup(limit: int = 20):
     return _build_worldcup_betfair(limit)
+
+
+@app.get('/odds/premierleague')
+def premier_league_odds(limit: int = 20):
+    """Live Betfair market prices for upcoming Premier League fixtures.
+
+    Separate from /predictions/* by design: this is what the exchange thinks,
+    with no input from the trained model."""
+    return _build_premier_league_odds(limit)
 
 
 @app.post('/predictions/archive')

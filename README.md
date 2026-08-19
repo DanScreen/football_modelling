@@ -19,7 +19,7 @@ Each match prediction returns **two** scorelines:
 | `Helper.py` | Core Bayesian model classes (`league`, `league_fast`) and CSV parsers |
 | `get_data.py` | Download match/betting CSVs (`fetch_csv`, `download_match_data`, `download_betting_data`) |
 | `Get_Odds.py` | Wrapper around [the-odds-api.com](https://the-odds-api.com/) for upcoming fixtures |
-| `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` (and knockout `TO_QUALIFY`) odds for World Cup fixtures |
+| `Betfair.py` | Betfair Exchange API client — pulls real `CORRECT_SCORE` (and knockout `TO_QUALIFY`) odds for World Cup and Premier League fixtures |
 | `*.ipynb` | Interactive analysis notebooks (Premier League, Superbru, Profitability, Optimisation, etc.) |
 | `AutoData/`, `BettingData/` | Downloaded CSVs, named `<season-end-year><league>.csv` (created on first data download) |
 | `pl_model.pkl` | Pickled trained model (created on first `/train`) |
@@ -56,12 +56,13 @@ Environment variables:
 | `MODEL_REFRESH_TTL` | `60` | Seconds between checks for a newer model in GCS (see [Model freshness](#model-freshness)) |
 | `DATA_STATE_BLOB` | `state/data_fingerprint.json` | GCS object holding the last-seen fingerprint of the upstream CSVs |
 | `DATA_STATE_PATH` | `.data_fingerprint.json` | Local fallback for the same, when `GCS_BUCKET` is unset |
-| `BETFAIR_APP_KEY` | _(unset)_ | Betfair Delayed Application Key — required for `/predictions/worldcup` |
+| `BETFAIR_APP_KEY` | _(unset)_ | Betfair Delayed Application Key — required for `/predictions/worldcup` and `/odds/premierleague` |
 | `BETFAIR_USERNAME` | _(unset)_ | Betfair account **username** (not email) |
 | `BETFAIR_PASSWORD` | _(unset)_ | Betfair account password |
 | `BETFAIR_CERT_FILE` / `BETFAIR_KEY_FILE` | _(unset)_ | Paths to the client cert/key for certificate login (local dev) |
 | `BETFAIR_CERT` / `BETFAIR_KEY` | _(unset)_ | PEM **contents** of the client cert/key (used on Cloud Run, injected as secrets) |
 | `BETFAIR_WC_QUERY` | `FIFA World Cup` | Text query used to locate the World Cup competition on the exchange |
+| `BETFAIR_PL_QUERY` | `English Premier League` | Text query used to locate the Premier League competition on the exchange |
 | `PORT` | `8000` (`8080` in container) | Port uvicorn listens on |
 
 ## Running the API
@@ -459,6 +460,59 @@ http://localhost:8000/predictions/worldcup/html?limit=20
 >   the paid Live key is only needed to place bets in real time.
 > - The exchange typically only lists `CORRECT_SCORE` markets with liquidity close to kickoff
 >   for major fixtures, so early group games may be thin or absent until nearer the tournament.
+
+### `GET /odds/premierleague`
+
+Live Betfair market prices for upcoming Premier League fixtures. **Independent of the trained
+model** — nothing in this response comes from `/predict` or `/predictions/*`; every number is a
+de-vigged exchange price. Useful as a benchmark to compare the model against, or on its own.
+
+League games settle on 90 minutes, so unlike the World Cup endpoint there is no extra-time
+correction and no `TO_QUALIFY` lookup.
+
+```
+curl 'http://localhost:8000/odds/premierleague?limit=10'
+```
+
+```json
+{
+  "source": "betfair",
+  "market": "CORRECT_SCORE",
+  "score_basis": "90min",
+  "count": 10,
+  "matches": [
+    {
+      "home_team": "Man United",
+      "away_team": "Nott'm Forest",
+      "betfair_home_team": "Man Utd",
+      "betfair_away_team": "Nottm Forest",
+      "competition": "English Premier League",
+      "commence_time": "2026-08-22T14:00:00+00:00",
+      "most_likely_score": {"home": 1, "away": 0},
+      "probabilities": {"home_win": 0.56, "draw": 0.26, "away_win": 0.18},
+      "top_scorelines": [{"home": 1, "away": 0, "prob": 0.12}],
+      "other_scorelines": {"home": 0.2, "draw": 0.08, "away": 0.12},
+      "superbru_optimal_score": {"home": 1, "away": 0, "expected_points": 0.895},
+      "overround": 1.06
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `home_team` / `away_team` | Normalised to the football-data.co.uk names the model uses, so rows line up with `/predictions/upcoming`. Unrecognised names pass through unchanged |
+| `betfair_home_team` / `betfair_away_team` | The names exactly as the exchange gives them |
+| `probabilities` | De-vigged 1X2 probabilities, summed from the correct-score book |
+| `top_scorelines` | The six most likely explicit scorelines |
+| `other_scorelines` | The "any other home/draw/away win" buckets, de-vigged |
+| `superbru_optimal_score` | Scoreline maximising expected SuperBru points **under the market's** distribution — still not a model prediction |
+| `overround` | Book sum before de-vigging (1.0 = a perfectly fair book) |
+
+Requires the same Betfair credentials as `/predictions/worldcup`. Fixtures with no correct-score
+market or liquidity come back with an `error` field instead of prices.
+
+---
 
 ## Typical workflow
 
