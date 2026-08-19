@@ -549,6 +549,13 @@ league**. Fixtures are canonical per competition, so both then see identical `fi
 A stream whose key is unset returns `503` and is simply skipped — the infrastructure can be
 deployed before the accounts exist.
 
+Terraform seeds both key secrets with the placeholder `__UNSET__`, because Cloud Run
+resolves `versions/latest` when creating a revision and **rejects the deploy outright if
+the secret has no version at all**. `lifecycle { ignore_changes = [secret_data] }` means
+adding the real key later isn't reverted by the next apply. The app recognises the
+placeholder and returns `503`, so an unconfigured stream fails loudly rather than
+submitting with a junk key and collecting 401s nobody notices.
+
 #### Fixture matching
 
 Team names arrive in four vocabularies: football-data.co.uk (the model), Betfair

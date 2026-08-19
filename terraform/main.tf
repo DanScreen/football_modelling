@@ -151,6 +151,31 @@ resource "google_secret_manager_secret" "scorers_betfair_api_key" {
   depends_on = [google_project_service.apis]
 }
 
+# Cloud Run resolves `versions/latest` at deploy time and refuses the revision
+# if the secret has no versions at all, so a secret created ahead of its real
+# value would break every deploy until the account existed. Seed a placeholder
+# version instead, and ignore later changes so adding the real key out of band
+# isn't reverted on the next apply. The app treats this exact value as "not
+# configured" and returns 503 for that stream - loudly unconfigured rather than
+# silently submitting with a junk key.
+resource "google_secret_manager_secret_version" "scorers_model_api_key_placeholder" {
+  secret      = google_secret_manager_secret.scorers_model_api_key.id
+  secret_data = local.scorers_key_placeholder
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
+resource "google_secret_manager_secret_version" "scorers_betfair_api_key_placeholder" {
+  secret      = google_secret_manager_secret.scorers_betfair_api_key.id
+  secret_data = local.scorers_key_placeholder
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
 resource "google_secret_manager_secret_iam_member" "run_scorers_model" {
   secret_id = google_secret_manager_secret.scorers_model_api_key.id
   role      = "roles/secretmanager.secretAccessor"
@@ -353,7 +378,13 @@ resource "google_cloud_run_v2_service" "api" {
     }
   }
 
-  depends_on = [google_project_service.apis]
+  # The secret versions, not just the secrets: Cloud Run resolves `latest` when
+  # it creates the revision and fails if the secret has no version yet.
+  depends_on = [
+    google_project_service.apis,
+    google_secret_manager_secret_version.scorers_model_api_key_placeholder,
+    google_secret_manager_secret_version.scorers_betfair_api_key_placeholder,
+  ]
 }
 
 resource "google_cloud_run_v2_service_iam_member" "public" {
@@ -372,6 +403,9 @@ resource "google_service_account" "scheduler" {
 }
 
 locals {
+  # Must match SCORERS_KEY_PLACEHOLDER in app.py.
+  scorers_key_placeholder = "__UNSET__"
+
   # Audience the scheduler mints its OIDC tokens for, and that the app verifies.
   # A fixed string rather than the service URL: the service needs this value as
   # an env var, and deriving it from the service would be a dependency cycle.

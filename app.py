@@ -52,6 +52,12 @@ SCORERS_STREAMS = {
     'model': 'SCORERS_MODEL_API_KEY',
     'betfair': 'SCORERS_BETFAIR_API_KEY',
 }
+# Terraform seeds both key secrets with this value, because Cloud Run refuses a
+# revision whose mounted secret has no version at all. Treat it as unset, so an
+# unconfigured stream fails loudly with a 503 instead of submitting a junk key
+# and getting a 401 nobody notices. Must match `scorers_key_placeholder` in
+# terraform/main.tf.
+SCORERS_KEY_PLACEHOLDER = '__UNSET__'
 TRAIN_START_SEASON = 1996
 DATA_LEAGUES = ('E0', 'E1', 'E2')   # E2 identifies the promoted sides - see start_next_season
 
@@ -770,8 +776,8 @@ def _submit_to_scorers(stream, limit, dry_run=False):
     env_var = SCORERS_STREAMS.get(stream)
     if env_var is None:
         raise HTTPException(400, f"Unknown stream '{stream}'. Expected one of {sorted(SCORERS_STREAMS)}")
-    api_key = os.environ.get(env_var)
-    if not api_key:
+    api_key = (os.environ.get(env_var) or '').strip()
+    if not api_key or api_key == SCORERS_KEY_PLACEHOLDER:
         raise HTTPException(503, f'{env_var} is not configured - no Scorers account for the {stream} stream yet')
 
     picks = _scorers_picks(stream, limit)
