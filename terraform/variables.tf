@@ -36,6 +36,12 @@ variable "schedule_cron" {
   description = "Cron expression for daily archive job (default 08:00 daily)"
 }
 
+variable "retrain_cron" {
+  type        = string
+  default     = "0 7 * * *"
+  description = "Cron expression for the daily data check / conditional retrain (default 07:00, before the archive job)"
+}
+
 variable "schedule_tz" {
   type    = string
   default = "Europe/London"

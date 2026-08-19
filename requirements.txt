@@ -5,4 +5,7 @@ numpy==1.26.4
 scipy==1.13.1
 requests==2.32.3
 google-cloud-storage==2.18.2
+# Imported directly to verify the scheduler's OIDC tokens. Range matches what
+# google-cloud-storage 2.18.2 already constrains it to, so no new resolution.
+google-auth>=2.26.1,<3.0.0
 pydantic==2.9.2

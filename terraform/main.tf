@@ -223,6 +223,18 @@ resource "google_cloud_run_v2_service" "api" {
         name  = "ARCHIVE_PREFIX"
         value = "predictions/"
       }
+      # The scheduler jobs authenticate with OIDC tokens rather than a shared
+      # secret. The service is public (the HTML views are bookmarked on a
+      # phone), so Cloud Run can't enforce this for us - the app verifies the
+      # token against this service account itself.
+      env {
+        name  = "OIDC_SERVICE_ACCOUNT"
+        value = google_service_account.scheduler.email
+      }
+      env {
+        name  = "OIDC_AUDIENCE"
+        value = local.service_audience
+      }
       env {
         name = "ODDS_API_KEY"
         value_source {
@@ -307,6 +319,46 @@ resource "google_service_account" "scheduler" {
   display_name = "Football daily scheduler"
 }
 
+locals {
+  # Audience the scheduler mints its OIDC tokens for, and that the app verifies.
+  # A fixed string rather than the service URL: the service needs this value as
+  # an env var, and deriving it from the service would be a dependency cycle.
+  # If unauthenticated access is ever removed, Cloud Run will require the
+  # audience to be the real service URL and this must change to match.
+  service_audience = "https://${var.service_name}"
+}
+
+# Checks football-data.co.uk for newly published results and retrains only if
+# something changed. Runs before the archive job so the day's archived
+# predictions come from a model trained on the freshest available data.
+resource "google_cloud_scheduler_job" "daily_retrain" {
+  name      = "football-daily-retrain"
+  schedule  = var.retrain_cron
+  time_zone = var.schedule_tz
+  region    = var.region
+
+  # Training is a single long request; let it finish rather than retrying into
+  # a 409 from the in-progress lock.
+  attempt_deadline = "600s"
+  retry_config {
+    retry_count = 0
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.api.uri}/model/refresh"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_cloud_scheduler_job" "daily_archive" {
   name      = "football-daily-archive"
   schedule  = var.schedule_cron
@@ -317,12 +369,24 @@ resource "google_cloud_scheduler_job" "daily_archive" {
     http_method = "POST"
     uri         = "${google_cloud_run_v2_service.api.uri}/predictions/archive?limit=20"
     headers = {
-      "X-API-Key"    = "__SET_VIA_GCLOUD__" # populate manually after `terraform apply` (or use Secret Manager + gcloud)
       "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
     }
   }
 
   depends_on = [google_project_service.apis]
+}
+
+# Not strictly required while the service allows unauthenticated access, but
+# keeps the scheduler working if that's ever tightened.
+resource "google_cloud_run_v2_service_iam_member" "scheduler_invoker" {
+  name     = google_cloud_run_v2_service.api.name
+  location = google_cloud_run_v2_service.api.location
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.scheduler.email}"
 }
 
 # ----------------------------------------------------------------------
