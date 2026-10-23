@@ -1,8 +1,10 @@
-fastapi==0.115.0
+fastapi==0.161.1
+# Pinned explicitly: FastAPI only sets a floor, and Starlette < 1.3.1 has open advisories.
+starlette==1.9.0
 uvicorn[standard]==0.30.6
 pandas==2.2.2
 numpy==1.26.4
 scipy==1.13.1
-requests==2.32.3
+requests==2.34.2
 google-cloud-storage==2.18.2
 pydantic==2.9.2
