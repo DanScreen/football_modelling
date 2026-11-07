@@ -4,19 +4,24 @@ import json
 import math
 import os
 import pickle
+import threading
+import time
 import uvicorn
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
+import requests
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from Helper import league, get_points_matrix
 from Get_Odds import get_odds
-from Betfair import get_worldcup_correct_score, BetfairError
+from Betfair import (get_worldcup_correct_score,
+                     get_premier_league_correct_score, BetfairError)
+from Scorers import ScorersClient, ScorersError, match_fixture
 from get_data import download_match_data
 
 MODEL_PATH = os.environ.get('MODEL_PATH', 'pl_model.pkl')
@@ -24,6 +29,38 @@ GCS_BUCKET = os.environ.get('GCS_BUCKET')
 MODEL_BLOB = os.environ.get('MODEL_BLOB', 'models/pl_model.pkl')
 ARCHIVE_PREFIX = os.environ.get('ARCHIVE_PREFIX', 'predictions/')
 API_KEY = os.environ.get('API_KEY')
+
+# Scheduled callers (Cloud Scheduler) authenticate with a Google OIDC token
+# instead of a shared secret. Cloud Run itself can't enforce that here because
+# the service must stay public for the bookmarked HTML views, so the token is
+# verified in-process against the service account allowed to call.
+OIDC_SERVICE_ACCOUNT = os.environ.get('OIDC_SERVICE_ACCOUNT')
+OIDC_AUDIENCE = os.environ.get('OIDC_AUDIENCE')
+
+# How often an instance may ask GCS whether a newer model has been published.
+MODEL_REFRESH_TTL = float(os.environ.get('MODEL_REFRESH_TTL', '60'))
+DATA_STATE_BLOB = os.environ.get('DATA_STATE_BLOB', 'state/data_fingerprint.json')
+DATA_STATE_PATH = os.environ.get('DATA_STATE_PATH', '.data_fingerprint.json')
+
+FOOTBALL_DATA_URL = 'https://www.football-data.co.uk/mmz4281/'
+
+# Scorers (scorersonline.uk) submission streams. Each stream is a separate
+# account on the site holding its own API key, so the model and the market get
+# independent leaderboard rows - the site has no notion of acting "on behalf
+# of" another user, and two accounts is the shape that gives.
+SCORERS_STREAMS = {
+    'model': 'SCORERS_MODEL_API_KEY',
+    'betfair': 'SCORERS_BETFAIR_API_KEY',
+}
+# Terraform seeds both key secrets with this value, because Cloud Run refuses a
+# revision whose mounted secret has no version at all. Treat it as unset, so an
+# unconfigured stream fails loudly with a 503 instead of submitting a junk key
+# and getting a 401 nobody notices. Must match `scorers_key_placeholder` in
+# terraform/main.tf.
+SCORERS_KEY_PLACEHOLDER = '__UNSET__'
+TRAIN_START_SEASON = 1996
+DATA_LEAGUES = ('E0', 'E1', 'E2')   # E2 identifies the promoted sides - see start_next_season
+
 SUPERBRU_MAX_GOALS = 6
 
 # Extra-time model (knockout ties only). SuperBru scores World Cup knockouts on
@@ -43,8 +80,9 @@ CONVERT_NAMES = {
     'AFC Bournemouth': 'Bournemouth', 'Bournemouth': 'Bournemouth',
     'Brentford': 'Brentford', 'Brighton and Hove Albion': 'Brighton',
     'Burnley': 'Burnley', 'Chelsea': 'Chelsea',
-    'Crystal Palace': 'Crystal Palace', 'Everton': 'Everton',
-    'Fulham': 'Fulham', 'Ipswich Town': 'Ipswich',
+    'Coventry City': 'Coventry', 'Crystal Palace': 'Crystal Palace',
+    'Everton': 'Everton', 'Fulham': 'Fulham',
+    'Hull City': 'Hull', 'Ipswich Town': 'Ipswich',
     'Leeds United': 'Leeds', 'Leicester City': 'Leicester',
     'Liverpool': 'Liverpool', 'Luton Town': 'Luton',
     'Manchester City': 'Man City', 'Manchester United': 'Man United',
@@ -55,7 +93,28 @@ CONVERT_NAMES = {
     'Wolverhampton Wanderers': 'Wolves',
 }
 
-state = {'model': None}
+# Betfair's own short names, where they differ from the football-data.co.uk
+# names the rest of the app uses. Only the mismatches need listing - most of
+# Betfair's names already agree.
+BETFAIR_NAMES = {
+    'Man Utd': 'Man United',
+    'Nottm Forest': "Nott'm Forest",
+    'Nottingham Forest': "Nott'm Forest",
+    'Spurs': 'Tottenham',
+    'Sheff Utd': 'Sheffield United',
+    'Sheff Wed': 'Sheffield Weds',
+    'Wolverhampton': 'Wolves',
+    'Brighton & Hove Albion': 'Brighton',
+    'Newcastle Utd': 'Newcastle',
+}
+
+state = {
+    'model': None,
+    'model_generation': None,   # GCS object generation the cached model came from
+    'checked_at': 0.0,          # monotonic clock of the last freshness check
+}
+
+_train_lock = threading.Lock()
 
 
 def _to_int(v):
@@ -225,18 +284,109 @@ def _knockout_120min_distribution(scorelines, other, qualify):
     return scorelines_120, other_120
 
 
+def _current_season(now=None):
+    """Season end-year for a date: the 2026/27 season is season 2027.
+
+    Seasons kick off in August, so July is the changeover point - anything from
+    July onwards belongs to the season ending the following year."""
+    now = now or datetime.now(timezone.utc)
+    return now.year + 1 if now.month >= 7 else now.year
+
+
+def _train_seasons():
+    return list(range(TRAIN_START_SEASON, _current_season() + 1))
+
+
+def _season_csv_url(season, league):
+    return f'{FOOTBALL_DATA_URL}{str(season - 1)[2:]}{str(season)[2:]}/{league}.csv'
+
+
+def _remote_fingerprint(seasons=None, leagues=DATA_LEAGUES):
+    """Fingerprint the published CSVs without downloading them.
+
+    A HEAD per file is enough: football-data.co.uk serves ETag, Last-Modified
+    and Content-Length, and rewrites a season's file in place as results come
+    in. Files that aren't published yet record their status code, so a season
+    appearing for the first time registers as a change like any other.
+
+    Files that error out are omitted rather than recorded, so a transient
+    network failure doesn't masquerade as new data (the caller merges over the
+    previous fingerprint, preserving what was already known)."""
+    if seasons is None:
+        current = _current_season()
+        seasons = [current, current - 1]
+    fingerprint = {}
+    for season in seasons:
+        for league in leagues:
+            try:
+                r = requests.head(_season_csv_url(season, league), timeout=20,
+                                  allow_redirects=False)
+            except requests.RequestException as e:
+                print(f'HEAD {season}{league} failed: {e}')
+                continue
+            if r.status_code != 200:
+                fingerprint[f'{season}{league}'] = f'absent:{r.status_code}'
+            else:
+                fingerprint[f'{season}{league}'] = (
+                    r.headers.get('ETag')
+                    or f"{r.headers.get('Last-Modified', '')}:{r.headers.get('Content-Length', '')}"
+                )
+    return fingerprint
+
+
+_gcs_state = {'client': None}
+
+
 def _gcs_client():
-    from google.cloud import storage
-    return storage.Client()
+    """Cached storage client. Constructing one resolves credentials, which costs
+    far more than the metadata call the freshness check is making, so it must
+    not happen per request."""
+    if _gcs_state['client'] is None:
+        from google.cloud import storage
+        _gcs_state['client'] = storage.Client()
+    return _gcs_state['client']
+
+
+def _model_blob():
+    return _gcs_client().bucket(GCS_BUCKET).blob(MODEL_BLOB)
+
+
+def _load_data_fingerprint():
+    if GCS_BUCKET:
+        try:
+            blob = _gcs_client().bucket(GCS_BUCKET).blob(DATA_STATE_BLOB)
+            if blob.exists():
+                return json.loads(blob.download_as_bytes())
+        except Exception as e:
+            print(f'Fingerprint load failed: {e}')
+        return {}
+    if os.path.exists(DATA_STATE_PATH):
+        with open(DATA_STATE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_data_fingerprint(fingerprint):
+    payload = json.dumps(fingerprint, indent=2, sort_keys=True)
+    if GCS_BUCKET:
+        _gcs_client().bucket(GCS_BUCKET).blob(DATA_STATE_BLOB).upload_from_string(
+            payload, content_type='application/json'
+        )
+        return
+    with open(DATA_STATE_PATH, 'w') as f:
+        f.write(payload)
 
 
 def _load_model():
     if GCS_BUCKET:
         try:
-            blob = _gcs_client().bucket(GCS_BUCKET).blob(MODEL_BLOB)
+            blob = _model_blob()
             if blob.exists():
+                blob.reload()  # populates generation
                 model = pickle.loads(blob.download_as_bytes())
-                print(f'Loaded model from gs://{GCS_BUCKET}/{MODEL_BLOB}')
+                state['model_generation'] = blob.generation
+                print(f'Loaded model from gs://{GCS_BUCKET}/{MODEL_BLOB} '
+                      f'(generation {blob.generation}, trained {_trained_at(model)})')
                 return model
             print(f'No model at gs://{GCS_BUCKET}/{MODEL_BLOB}')
         except Exception as e:
@@ -253,10 +403,52 @@ def _save_model(model):
     with open(MODEL_PATH, 'wb') as f:
         f.write(payload)
     if GCS_BUCKET:
-        _gcs_client().bucket(GCS_BUCKET).blob(MODEL_BLOB).upload_from_string(
-            payload, content_type='application/octet-stream'
-        )
-        print(f'Uploaded model to gs://{GCS_BUCKET}/{MODEL_BLOB}')
+        blob = _model_blob()
+        blob.metadata = {'trained_at': _trained_at(model) or ''}
+        blob.upload_from_string(payload, content_type='application/octet-stream')
+        # Remember what we just wrote, so the freshness check doesn't turn round
+        # and re-download the model this instance already holds.
+        state['model_generation'] = blob.generation
+        print(f'Uploaded model to gs://{GCS_BUCKET}/{MODEL_BLOB} '
+              f'(generation {blob.generation})')
+
+
+def _trained_at(model):
+    return getattr(model, 'trained_at', None)
+
+
+def _ensure_fresh_model():
+    """Adopt the model in GCS if it's newer than the one this instance holds.
+
+    Prediction requests call this, but it's rate-limited to one check per
+    MODEL_REFRESH_TTL seconds. A prediction is ~0.25ms of work while a GCS
+    metadata round-trip is tens of milliseconds, so checking on every request
+    would make the check cost far more than the thing it guards. Retraining
+    happens at most once a day, so a minute of staleness is immaterial.
+
+    Staleness is judged on the object's generation rather than a timestamp:
+    it's monotonic per write and immune to clock skew between instances.
+
+    Any failure is swallowed - a GCS blip must not take predictions down with
+    it. The cached model stays in service and the next check tries again."""
+    if not GCS_BUCKET:
+        return
+    now = time.monotonic()
+    if now - state['checked_at'] < MODEL_REFRESH_TTL:
+        return
+    state['checked_at'] = now
+    try:
+        blob = _model_blob()
+        blob.reload()  # metadata only - no download
+        if blob.generation == state['model_generation']:
+            return
+        model = pickle.loads(blob.download_as_bytes())
+        state['model'] = model
+        state['model_generation'] = blob.generation
+        print(f'Pulled newer model from GCS (generation {blob.generation}, '
+              f'trained {_trained_at(model)})')
+    except Exception as e:
+        print(f'Model freshness check failed, keeping cached model: {e}')
 
 
 def _archive_predictions(payload):
@@ -275,6 +467,71 @@ def _require_api_key(provided: Optional[str]):
         return  # auth disabled
     if provided != API_KEY:
         raise HTTPException(401, 'Invalid or missing X-API-Key header')
+
+
+def _verify_oidc(authorization: Optional[str]) -> bool:
+    """True if the request carries a valid Google OIDC token for the caller we
+    expect. Used by the Cloud Scheduler jobs so they don't need a shared secret.
+
+    The token is verified here rather than by Cloud Run because the service is
+    public - the HTML views are bookmarked on a phone - so the platform lets
+    every request through and can't do it for us."""
+    if not (OIDC_SERVICE_ACCOUNT and authorization):
+        return False
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        return False
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token
+        claims = id_token.verify_oauth2_token(
+            parts[1], google_requests.Request(), audience=OIDC_AUDIENCE or None
+        )
+    except Exception as e:
+        print(f'OIDC verification failed: {e}')
+        return False
+    return bool(claims.get('email_verified')) and claims.get('email') == OIDC_SERVICE_ACCOUNT
+
+
+def _require_caller(x_api_key: Optional[str], authorization: Optional[str] = None):
+    """Scheduled jobs authenticate with an OIDC token, people with an API key."""
+    if _verify_oidc(authorization):
+        return
+    _require_api_key(x_api_key)
+
+
+def _retrain(seasons=None, download=False):
+    """Train a model, roll it into the new season if needed, and publish it."""
+    if download:
+        download_match_data(year_range=range(TRAIN_START_SEASON, _current_season() + 1),
+                            leagues=list(DATA_LEAGUES))
+    seasons = seasons or _train_seasons()
+    PL = league()
+    PL.train_all(league_str='E0', league_below='E1', SEA=seasons)
+    trained = list(getattr(PL, 'seasons_trained', None) or seasons)
+
+    # Seasons with no E0 file yet were skipped. If the newest one has already
+    # started in the divisions below, roll the model into it so the promoted
+    # sides are predictable before the first Premier League results land.
+    rolled = None
+    pending = [s for s in seasons if s > max(trained)]
+    if pending:
+        rolled = PL.start_next_season(min(pending))
+
+    PL.trained_at = datetime.now(timezone.utc).isoformat()
+    state['model'] = PL
+    _save_model(PL)
+    return {
+        'seasons': trained,
+        'seasons_requested': seasons,
+        'rolled_forward_to': getattr(PL, 'rolled_forward_to', None),
+        'season_changes': {'out': rolled[0], 'in': rolled[1]} if rolled else None,
+        'trained_at': PL.trained_at,
+        'model_generation': state['model_generation'],
+        'teams': list(PL.teams),
+        'model_path': MODEL_PATH,
+        'gcs_uri': f'gs://{GCS_BUCKET}/{MODEL_BLOB}' if GCS_BUCKET else None,
+    }
 
 
 @asynccontextmanager
@@ -325,6 +582,7 @@ def _format_prediction(home, away, prediction, commence_time=None):
 
 
 def _build_upcoming(limit: int):
+    _ensure_fresh_model()
     PL = state['model']
     if PL is None:
         raise HTTPException(503, 'Model not trained. POST /train first.')
@@ -414,32 +672,259 @@ def _build_worldcup_betfair(limit: int):
     return {'count': len(results), 'matches': results}
 
 
+def _normalise_betfair_team(name):
+    """Map a Betfair team name onto the football-data.co.uk name the model uses,
+    so odds can be cross-referenced with /predictions/upcoming. Unknown names
+    pass through unchanged - this endpoint reports the market, and does not need
+    the model to have heard of the team."""
+    if name in BETFAIR_NAMES:
+        return BETFAIR_NAMES[name]
+    if name in CONVERT_NAMES:
+        return CONVERT_NAMES[name]
+    return name
+
+
+def _build_premier_league_odds(limit: int):
+    """Upcoming Premier League fixtures priced straight off the Betfair exchange.
+
+    Deliberately independent of the trained model: nothing here reads `state`,
+    and no Poisson assumption is made. Every number is the de-vigged market
+    price. League games settle on 90 minutes, so there is no extra-time
+    correction to apply either."""
+    try:
+        matches = get_premier_league_correct_score(max_markets=limit)
+    except BetfairError as e:
+        raise HTTPException(502, f'Betfair error: {e}')
+    if not matches:
+        raise HTTPException(502, 'No Premier League correct-score markets available on Betfair.')
+
+    results = []
+    for m in matches[:limit]:
+        home, away = m['match']
+        scorelines = m['scorelines']
+        other = m['other']
+        commence = m['time'].isoformat() if m['time'] else None
+        entry = {
+            'home_team': _normalise_betfair_team(home),
+            'away_team': _normalise_betfair_team(away),
+            'betfair_home_team': home,
+            'betfair_away_team': away,
+            'competition': m.get('competition'),
+            'commence_time': commence,
+        }
+        if not scorelines and not any(other.values()):
+            entry['error'] = 'no correct-score liquidity on Betfair'
+            results.append(entry)
+            continue
+
+        ml = max(scorelines, key=scorelines.get) if scorelines else None
+        top = sorted(scorelines.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        entry.update({
+            'most_likely_score': {'home': ml[0], 'away': ml[1]} if ml else None,
+            'probabilities': _outcome_probs(scorelines, other),
+            'top_scorelines': [
+                {'home': k[0], 'away': k[1], 'prob': round(v, 4)} for k, v in top
+            ],
+            'other_scorelines': {k: round(v, 4) for k, v in other.items()},
+            'superbru_optimal_score': _superbru_optimal_betfair(scorelines, other),
+            'overround': round(m['overround'], 4),
+        })
+        results.append(entry)
+    return {
+        'source': 'betfair',
+        'market': 'CORRECT_SCORE',
+        'score_basis': '90min',
+        'count': len(results),
+        'matches': results,
+    }
+
+
+def _scorers_picks(stream, limit):
+    """The picks a stream wants to submit, as (home, away, kickoff, pick) rows.
+
+    Both builders already expose `superbru_optimal_score` computed against the
+    same points matrix Scorers scores with (3 / 1.5 / 1 / 0, GD-preserving
+    close), so no re-optimisation is needed here."""
+    if stream == 'model':
+        payload = _build_upcoming(limit)
+    else:
+        payload = _build_premier_league_odds(limit)
+    rows = []
+    for m in payload['matches']:
+        pick = m.get('superbru_optimal_score')
+        if m.get('error') or not pick:
+            continue
+        rows.append({
+            'home_team': m['home_team'],
+            'away_team': m['away_team'],
+            'commence_time': m.get('commence_time'),
+            'home': pick['home'],
+            'away': pick['away'],
+            'expected_points': pick.get('expected_points', 0.0),
+        })
+    return rows
+
+
+def _submit_to_scorers(stream, limit, dry_run=False):
+    """Submit one stream's picks to Scorers under that stream's own API key.
+
+    Two passes on purpose. The scores pass omits `isBanker` entirely, so it can
+    never disturb a banker already set; the banker pass then sets one per round
+    on the highest expected-points fixture. Doing it in one pass would risk the
+    site's 422 on a locked banker masking an otherwise successful score
+    submission, since the prediction is saved before the banker is applied."""
+    env_var = SCORERS_STREAMS.get(stream)
+    if env_var is None:
+        raise HTTPException(400, f"Unknown stream '{stream}'. Expected one of {sorted(SCORERS_STREAMS)}")
+    api_key = (os.environ.get(env_var) or '').strip()
+    if not api_key or api_key == SCORERS_KEY_PLACEHOLDER:
+        raise HTTPException(503, f'{env_var} is not configured - no Scorers account for the {stream} stream yet')
+
+    picks = _scorers_picks(stream, limit)
+    try:
+        client = ScorersClient(api_key)
+        fixtures = client.open_fixtures()
+    except ScorersError as e:
+        raise HTTPException(502, f'Scorers error: {e}')
+
+    submitted, skipped, failed = [], [], []
+    matched = []
+    for p in picks:
+        fx = match_fixture(fixtures, p['home_team'], p['away_team'], p['commence_time'])
+        if fx is None:
+            # No confident match - skipping beats guessing, which would submit
+            # this pick against somebody else's fixture.
+            skipped.append({'home_team': p['home_team'], 'away_team': p['away_team'],
+                            'reason': 'no confident fixture match on Scorers'})
+            continue
+        matched.append((p, fx))
+
+    for p, fx in matched:
+        entry = {
+            'fixture_id': fx['id'],
+            'round': fx.get('round'),
+            'scorers_fixture': f"{fx.get('homeTeam')} v {fx.get('awayTeam')}",
+            'our_fixture': f"{p['home_team']} v {p['away_team']}",
+            'score': {'home': p['home'], 'away': p['away']},
+            'expected_points': round(p['expected_points'], 4),
+        }
+        if dry_run:
+            submitted.append({**entry, 'dry_run': True})
+            continue
+        try:
+            res = client.submit(fx['id'], p['home'], p['away'])
+        except ScorersError as e:
+            raise HTTPException(502, f'Scorers error: {e}')
+        if res['ok']:
+            submitted.append(entry)
+        else:
+            failed.append({**entry, 'status': res['status'], 'error': res['error']})
+
+    # One banker per round, on the pick we expect most from. It is upside-only
+    # (minimum score 0, doubled), so not setting one simply forfeits points.
+    bankers = {}
+    for p, fx in matched:
+        rnd = fx.get('round')
+        if rnd is None:
+            continue
+        if rnd not in bankers or p['expected_points'] > bankers[rnd][0]['expected_points']:
+            bankers[rnd] = (p, fx)
+
+    banker_results = []
+    for rnd, (p, fx) in sorted(bankers.items()):
+        entry = {'round': rnd, 'fixture_id': fx['id'],
+                 'fixture': f"{fx.get('homeTeam')} v {fx.get('awayTeam')}",
+                 'expected_points': round(p['expected_points'], 4)}
+        if dry_run:
+            banker_results.append({**entry, 'dry_run': True})
+            continue
+        try:
+            res = client.submit(fx['id'], p['home'], p['away'], is_banker=True)
+        except ScorersError as e:
+            raise HTTPException(502, f'Scorers error: {e}')
+        # A locked banker (the round already has one on a kicked-off match) is
+        # an expected outcome, not a failure of the run - the score still stands.
+        banker_results.append({**entry, 'ok': res['ok'],
+                               **({} if res['ok'] else {'error': res['error']})})
+
+    return {
+        'stream': stream,
+        'dry_run': dry_run,
+        'open_fixtures': len(fixtures),
+        'picks': len(picks),
+        'submitted': submitted,
+        'bankers': banker_results,
+        'skipped': skipped,
+        'failed': failed,
+        'counts': {'submitted': len(submitted), 'skipped': len(skipped), 'failed': len(failed)},
+    }
+
+
 @app.get('/health')
 def health():
-    return {'status': 'ok', 'model_loaded': state['model'] is not None}
+    return {
+        'status': 'ok',
+        'model_loaded': state['model'] is not None,
+        'model_trained_at': _trained_at(state['model']),
+        'model_generation': state['model_generation'],
+        'current_season': _current_season(),
+    }
 
 
 @app.post('/train')
-def train(req: TrainRequest, x_api_key: Optional[str] = Header(default=None)):
-    _require_api_key(x_api_key)
-    if req.download_data:
-        download_match_data(year_range=range(1996, 2027), leagues=['E0', 'E1'])
-    seasons = req.seasons or list(range(1996, 2027))
-    PL = league()
-    PL.train_all(league_str='E0', league_below='E1', SEA=seasons)
-    state['model'] = PL
-    _save_model(PL)
-    return {
-        'status': 'trained',
-        'seasons': seasons,
-        'teams': list(PL.teams),
-        'model_path': MODEL_PATH,
-        'gcs_uri': f'gs://{GCS_BUCKET}/{MODEL_BLOB}' if GCS_BUCKET else None,
-    }
+def train(req: TrainRequest,
+          x_api_key: Optional[str] = Header(default=None),
+          authorization: Optional[str] = Header(default=None)):
+    _require_caller(x_api_key, authorization)
+    if not _train_lock.acquire(blocking=False):
+        raise HTTPException(409, 'A retrain is already in progress')
+    try:
+        result = _retrain(seasons=req.seasons, download=req.download_data)
+    finally:
+        _train_lock.release()
+    return {'status': 'trained', **result}
+
+
+@app.post('/model/refresh')
+def refresh_model(force: bool = Query(default=False),
+                  x_api_key: Optional[str] = Header(default=None),
+                  authorization: Optional[str] = Header(default=None)):
+    """Retrain, but only if football-data.co.uk has published something new.
+
+    Called daily by Cloud Scheduler. The check is a handful of HEAD requests
+    against the current and previous season's CSVs; training only runs when one
+    of them has changed, so an ordinary day costs almost nothing."""
+    _require_caller(x_api_key, authorization)
+    previous = _load_data_fingerprint()
+    current = _remote_fingerprint()
+    if not current:
+        raise HTTPException(502, 'Could not reach football-data.co.uk to check for new data')
+    changed = sorted(k for k, v in current.items() if previous.get(k) != v)
+
+    if not changed and not force:
+        return {
+            'status': 'up-to-date',
+            'checked': sorted(current),
+            'changed': [],
+            'trained_at': _trained_at(state['model']),
+            'model_generation': state['model_generation'],
+        }
+
+    if not _train_lock.acquire(blocking=False):
+        raise HTTPException(409, 'A retrain is already in progress')
+    try:
+        result = _retrain(download=True)
+        # Only record the new fingerprint once training has actually succeeded,
+        # so a failed run is retried tomorrow rather than silently skipped.
+        _save_data_fingerprint({**previous, **current})
+    finally:
+        _train_lock.release()
+    return {'status': 'retrained', 'checked': sorted(current), 'changed': changed, **result}
 
 
 @app.post('/predict')
 def predict(req: PredictRequest):
+    _ensure_fresh_model()
     PL = state['model']
     if PL is None:
         raise HTTPException(503, 'Model not trained. POST /train first.')
@@ -461,12 +946,37 @@ def worldcup(limit: int = 20):
     return _build_worldcup_betfair(limit)
 
 
+@app.post('/submissions/scorers')
+def submit_scorers(stream: str = Query(..., pattern='^(model|betfair)$'),
+                   limit: int = Query(default=20),
+                   dry_run: bool = Query(default=False),
+                   x_api_key: Optional[str] = Header(default=None),
+                   authorization: Optional[str] = Header(default=None)):
+    """Submit a stream's picks to Scorers under that stream's own account.
+
+    `stream=model` plays the Bayesian model; `stream=betfair` plays the
+    de-vigged exchange prices. Idempotent - Scorers overwrites on repeat POSTs,
+    so re-running is safe and picks sharpen as kickoff approaches."""
+    _require_caller(x_api_key, authorization)
+    return _submit_to_scorers(stream, limit, dry_run=dry_run)
+
+
+@app.get('/odds/premierleague')
+def premier_league_odds(limit: int = 20):
+    """Live Betfair market prices for upcoming Premier League fixtures.
+
+    Separate from /predictions/* by design: this is what the exchange thinks,
+    with no input from the trained model."""
+    return _build_premier_league_odds(limit)
+
+
 @app.post('/predictions/archive')
 def archive(
     limit: int = Query(default=20),
     x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ):
-    _require_api_key(x_api_key)
+    _require_caller(x_api_key, authorization)
     payload = _build_upcoming(limit)
     payload['generated_at'] = datetime.now(timezone.utc).isoformat()
     archived_uri = _archive_predictions(payload)

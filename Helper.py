@@ -4,6 +4,7 @@
 # In[1]:
 
 
+import os
 import pandas as pd
 import numpy as np
 import re
@@ -52,6 +53,49 @@ def logit(x):
 def inv_logit(x):
     return np.log(x/(1-x))
 
+def season_file(season, league_str):
+    return 'AutoData/'+str(season)+str(league_str)+'.csv'
+
+def available_seasons(SEA, league_str):
+    """Drop seasons whose main league CSV hasn't been downloaded yet.
+
+    football-data.co.uk only publishes a season's file once it kicks off, so a
+    range that runs to the current season will reference a file that may not
+    exist. Seasons are skipped rather than raising, so training always uses
+    whatever data is on disk."""
+    present = [i for i in SEA if os.path.exists(season_file(i, league_str))]
+    missing = [i for i in SEA if i not in present]
+    if missing:
+        print('Skipping seasons with no '+str(league_str)+' data: '+
+              ', '.join(str(i) for i in missing))
+    if not present:
+        raise FileNotFoundError(
+            'No '+str(league_str)+' season files found in AutoData/ for seasons '+
+            str(list(SEA))+'. Download the data first.')
+    return present
+
+def read_season(season, league_str):
+    """Read a season's CSV, or return an empty frame if it isn't downloaded.
+
+    Used for the feeder/parent divisions, which are only needed to work out who
+    was promoted/relegated into the *following* season — so a missing current
+    season file costs nothing until that next season exists."""
+    path = season_file(season, league_str)
+    if not os.path.exists(path):
+        print('No data for season '+str(season)+' '+str(league_str)+' - continuing without it')
+        return pd.DataFrame(columns=['Div', 'Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR'])
+    return read_football_data(path)
+
+def season_teams(data):
+    """All teams in a season, from home *and* away fixtures.
+
+    Part-played seasons matter here: after one round only half the division has
+    played at home, so keying off HomeTeam alone would miss the rest. For a
+    completed season this is identical to the home-team list."""
+    if data.empty:
+        return np.array([], dtype=object)
+    return np.unique(np.concatenate([data['HomeTeam'].values, data['AwayTeam'].values]))
+
 
 # In[3]:
 
@@ -84,6 +128,8 @@ class league_fast():
         self.promoted = promoted
         self.relegated = relegated
         self.trained_data = trained_data
+        self.seasons_trained = []
+        self.rolled_forward_to = None
     
     def initialise(self, teams):
         self.teams = teams
@@ -211,57 +257,89 @@ class league_fast():
         self.beta_hat = (self.p_beta-1)/self.q_beta
         self.gamma_hat = (self.p_gamma-1)/self.q_gamma
         
+    def start_next_season(self, season, league_below='E1', league_below_2='E2'):
+        """Advance the model into `season` before that division's own file exists.
+
+        football-data.co.uk publishes a division's CSV only once it kicks off, and
+        the Premier League lags the EFL by a week or two, so there is a window each
+        August where the new season has started but there are no matches to train
+        on. The new line-up is already implied by the divisions below, though:
+        whoever went down turns up in the feeder division, and whoever came up is
+        missing from both the feeder division and the one below that. Applying the
+        promoted/relegated priors now means the new sides can be predicted straight
+        away instead of erroring as unknown teams.
+
+        Returns (teams_out, promoted_in) if the model was advanced, else None.
+        """
+        below_now = read_season(season, league_below)
+        below_before = read_season(season - 1, league_below)
+        below_2_now = read_season(season, league_below_2)
+        if below_now.empty or below_before.empty or below_2_now.empty:
+            print('Cannot roll forward into ' + str(season) +
+                  ': need ' + str(league_below) + ' for ' + str(season - 1) + ' and ' +
+                  str(season) + ' plus ' + str(league_below_2) + ' for ' + str(season))
+            return None
+
+        now_below = set(season_teams(below_now))
+        teams_out = sorted(set(self.teams) & now_below)
+        promoted_in = sorted(set(season_teams(below_before)) - now_below - set(season_teams(below_2_now)))
+
+        # new_season rebuilds the parameter arrays over a fixed roster size, so a
+        # lopsided swap would silently corrupt them. Bail out instead.
+        if not teams_out or len(teams_out) != len(promoted_in):
+            print('Cannot roll forward into ' + str(season) + ': inferred ' +
+                  str(len(teams_out)) + ' out / ' + str(len(promoted_in)) + ' in ' +
+                  '(' + str(teams_out) + ' / ' + str(promoted_in) + ')')
+            return None
+
+        self.new_season(teams_out, promoted_in)
+        self.rolled_forward_to = season
+        print('Rolled forward into ' + str(season) + ': out ' + str(teams_out) +
+              ', in ' + str(promoted_in))
+        return teams_out, promoted_in
+
     def train_all(self, league_str, league_below=None, league_above=None, SEA = list(range(1996, 2021))):
-        NS = []
-        NS_below = []
-        NS_above = []
-        for i in SEA:
-            NS.append('AutoData/'+str(i)+league_str+'.csv')
-            if league_below:
-                NS_below.append('AutoData/'+str(i)+league_below+'.csv')
-            if league_above:
-                NS_above.append('AutoData/'+str(i)+str(league_above)+'.csv')
+        SEA = available_seasons(SEA, league_str)
+        self.seasons_trained = list(SEA)
         
-#         print(NS)
-#         print(NS_below)
-        data = read_football_data(NS[0])
-        teams = np.unique(data['HomeTeam'])
+        data = read_football_data(season_file(SEA[0], league_str))
+        teams = season_teams(data)
 
         self.teams = teams
         self.NT = len(teams)
 
         if league_below:
-            data_below = read_football_data(NS_below[0])
-            teams_below = np.unique(data_below['HomeTeam'])
+            data_below = read_season(SEA[0], league_below)
+            teams_below = season_teams(data_below)
 
         if league_above:
-            data_above = read_football_data(NS_above[0])
-            teams_above = np.unique(data_above['HomeTeam'])
+            data_above = read_season(SEA[0], league_above)
+            teams_above = season_teams(data_above)
 
         print('Season: ' + str(SEA[0]), end="\r")
         self.initialise(teams)
         self.train(data)
         promoted_in=None
         relegated_in=None
-        for i in range(1, len(NS)):
+        for i in range(1, len(SEA)):
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
             old_teams = teams
-            data = read_football_data(NS[i])
-            teams = np.unique(data['HomeTeam'])
+            data = read_football_data(season_file(SEA[i], league_str))
+            teams = season_teams(data)
             teams_out = list(set(old_teams) - set(teams))
 
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = read_football_data(NS_below[i])
-                teams_below = np.unique(data_below['HomeTeam'])
+                data_below = read_season(SEA[i], league_below)
+                teams_below = season_teams(data_below)
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = read_football_data(NS_above[i])
-                teams_above = np.unique(data_above['HomeTeam'])
+                data_above = read_season(SEA[i], league_above)
+                teams_above = season_teams(data_above)
 
             if league_below:
                 promoted_in =  sorted(list(set(old_teams_below) & set(teams)))
@@ -303,6 +381,8 @@ class league():
         self.promoted = promoted
         self.relegated = relegated
         self.trained_data = trained_data
+        self.seasons_trained = []
+        self.rolled_forward_to = None
     
     def initialise(self, teams):
         self.teams = teams
@@ -458,30 +538,64 @@ class league():
         self.beta_hat = (self.p_beta-1)/self.q_beta
         self.gamma_hat = (self.p_gamma-1)/self.q_gamma
         
+    def start_next_season(self, season, league_below='E1', league_below_2='E2'):
+        """Advance the model into `season` before that division's own file exists.
+
+        football-data.co.uk publishes a division's CSV only once it kicks off, and
+        the Premier League lags the EFL by a week or two, so there is a window each
+        August where the new season has started but there are no matches to train
+        on. The new line-up is already implied by the divisions below, though:
+        whoever went down turns up in the feeder division, and whoever came up is
+        missing from both the feeder division and the one below that. Applying the
+        promoted/relegated priors now means the new sides can be predicted straight
+        away instead of erroring as unknown teams.
+
+        Returns (teams_out, promoted_in) if the model was advanced, else None.
+        """
+        below_now = read_season(season, league_below)
+        below_before = read_season(season - 1, league_below)
+        below_2_now = read_season(season, league_below_2)
+        if below_now.empty or below_before.empty or below_2_now.empty:
+            print('Cannot roll forward into ' + str(season) +
+                  ': need ' + str(league_below) + ' for ' + str(season - 1) + ' and ' +
+                  str(season) + ' plus ' + str(league_below_2) + ' for ' + str(season))
+            return None
+
+        now_below = set(season_teams(below_now))
+        teams_out = sorted(set(self.teams) & now_below)
+        promoted_in = sorted(set(season_teams(below_before)) - now_below - set(season_teams(below_2_now)))
+
+        # new_season rebuilds the parameter arrays over a fixed roster size, so a
+        # lopsided swap would silently corrupt them. Bail out instead.
+        if not teams_out or len(teams_out) != len(promoted_in):
+            print('Cannot roll forward into ' + str(season) + ': inferred ' +
+                  str(len(teams_out)) + ' out / ' + str(len(promoted_in)) + ' in ' +
+                  '(' + str(teams_out) + ' / ' + str(promoted_in) + ')')
+            return None
+
+        self.new_season(teams_out, promoted_in)
+        self.rolled_forward_to = season
+        print('Rolled forward into ' + str(season) + ': out ' + str(teams_out) +
+              ', in ' + str(promoted_in))
+        return teams_out, promoted_in
+
     def train_all(self, league_str, league_below=None, league_above=None, SEA = list(range(1996, 2021))):
-        NS = []
-        NS_below = []
-        NS_above = []
-        for i in SEA:
-            NS.append('AutoData/'+str(i)+league_str+'.csv')
-            if league_below:
-                NS_below.append('AutoData/'+str(i)+league_below+'.csv')
-            if league_above:
-                NS_above.append('AutoData/'+str(i)+str(league_above)+'.csv')
+        SEA = available_seasons(SEA, league_str)
+        self.seasons_trained = list(SEA)
         
-        data = read_football_data(NS[0])
-        teams = np.unique(data['HomeTeam'])
+        data = read_football_data(season_file(SEA[0], league_str))
+        teams = season_teams(data)
 
         self.teams = teams
         self.NT = len(teams)
 
         if league_below:
-            data_below = read_football_data(NS_below[0])
-            teams_below = np.unique(data_below['HomeTeam'])
+            data_below = read_season(SEA[0], league_below)
+            teams_below = season_teams(data_below)
 
         if league_above:
-            data_above = read_football_data(NS_above[0])
-            teams_above = np.unique(data_above['HomeTeam'])
+            data_above = read_season(SEA[0], league_above)
+            teams_above = season_teams(data_above)
 
         print('Season: ' + str(SEA[0]), end="\r")
         self.initialise(teams)
@@ -490,27 +604,27 @@ class league():
         seasons = [SEA[0]]*matches
         promoted_in=None
         relegated_in=None
-        for i in range(1, len(NS)):
+        for i in range(1, len(SEA)):
             print('Season: ' + str(SEA[i]), end="\r")
             old_data = data
             old_teams = teams
-            data = read_football_data(NS[i])
+            data = read_football_data(season_file(SEA[i], league_str))
             matches = data.shape[0]
             seasons = np.append(seasons, [SEA[i]]*matches)
-            teams = np.unique(data['HomeTeam'])
+            teams = season_teams(data)
             teams_out = list(set(old_teams) - set(teams))
 
             if league_below:
                 old_data_below = data_below
                 old_teams_below = teams_below
-                data_below = read_football_data(NS_below[i])
-                teams_below = np.unique(data_below['HomeTeam'])
+                data_below = read_season(SEA[i], league_below)
+                teams_below = season_teams(data_below)
 
             if league_above:
                 old_data_above = data_above
                 old_teams_above = teams_above
-                data_above = read_football_data(NS_above[i])
-                teams_above = np.unique(data_above['HomeTeam'])
+                data_above = read_season(SEA[i], league_above)
+                teams_above = season_teams(data_above)
 
             if league_below:
                 promoted_in =  sorted(list(set(old_teams_below) & set(teams)))
