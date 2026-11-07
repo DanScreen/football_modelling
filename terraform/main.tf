@@ -131,6 +131,63 @@ resource "google_secret_manager_secret" "betfair_key" {
   depends_on = [google_project_service.apis]
 }
 
+# Scorers (scorersonline.uk) bot API keys - one per account, so the model and
+# the Betfair market each play the league as their own player. Values are set
+# out of band once the two bot accounts exist; the API returns 503 for a stream
+# whose key is still empty, so the infra can land ahead of the accounts.
+resource "google_secret_manager_secret" "scorers_model_api_key" {
+  secret_id = "scorers-model-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret" "scorers_betfair_api_key" {
+  secret_id = "scorers-betfair-api-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+# Cloud Run resolves `versions/latest` at deploy time and refuses the revision
+# if the secret has no versions at all, so a secret created ahead of its real
+# value would break every deploy until the account existed. Seed a placeholder
+# version instead, and ignore later changes so adding the real key out of band
+# isn't reverted on the next apply. The app treats this exact value as "not
+# configured" and returns 503 for that stream - loudly unconfigured rather than
+# silently submitting with a junk key.
+resource "google_secret_manager_secret_version" "scorers_model_api_key_placeholder" {
+  secret      = google_secret_manager_secret.scorers_model_api_key.id
+  secret_data = local.scorers_key_placeholder
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
+resource "google_secret_manager_secret_version" "scorers_betfair_api_key_placeholder" {
+  secret      = google_secret_manager_secret.scorers_betfair_api_key.id
+  secret_data = local.scorers_key_placeholder
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
+resource "google_secret_manager_secret_iam_member" "run_scorers_model" {
+  secret_id = google_secret_manager_secret.scorers_model_api_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "run_scorers_betfair" {
+  secret_id = google_secret_manager_secret.scorers_betfair_api_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "run_odds" {
   secret_id = google_secret_manager_secret.odds_api_key.id
   role      = "roles/secretmanager.secretAccessor"
@@ -223,6 +280,18 @@ resource "google_cloud_run_v2_service" "api" {
         name  = "ARCHIVE_PREFIX"
         value = "predictions/"
       }
+      # The scheduler jobs authenticate with OIDC tokens rather than a shared
+      # secret. The service is public (the HTML views are bookmarked on a
+      # phone), so Cloud Run can't enforce this for us - the app verifies the
+      # token against this service account itself.
+      env {
+        name  = "OIDC_SERVICE_ACCOUNT"
+        value = google_service_account.scheduler.email
+      }
+      env {
+        name  = "OIDC_AUDIENCE"
+        value = local.service_audience
+      }
       env {
         name = "ODDS_API_KEY"
         value_source {
@@ -278,6 +347,26 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
       env {
+        name = "SCORERS_MODEL_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.scorers_model_api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name = "SCORERS_BETFAIR_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.scorers_betfair_api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
         name = "BETFAIR_KEY"
         value_source {
           secret_key_ref {
@@ -289,7 +378,13 @@ resource "google_cloud_run_v2_service" "api" {
     }
   }
 
-  depends_on = [google_project_service.apis]
+  # The secret versions, not just the secrets: Cloud Run resolves `latest` when
+  # it creates the revision and fails if the secret has no version yet.
+  depends_on = [
+    google_project_service.apis,
+    google_secret_manager_secret_version.scorers_model_api_key_placeholder,
+    google_secret_manager_secret_version.scorers_betfair_api_key_placeholder,
+  ]
 }
 
 resource "google_cloud_run_v2_service_iam_member" "public" {
@@ -307,6 +402,82 @@ resource "google_service_account" "scheduler" {
   display_name = "Football daily scheduler"
 }
 
+locals {
+  # Must match SCORERS_KEY_PLACEHOLDER in app.py.
+  scorers_key_placeholder = "__UNSET__"
+
+  # Audience the scheduler mints its OIDC tokens for, and that the app verifies.
+  # A fixed string rather than the service URL: the service needs this value as
+  # an env var, and deriving it from the service would be a dependency cycle.
+  # If unauthenticated access is ever removed, Cloud Run will require the
+  # audience to be the real service URL and this must change to match.
+  service_audience = "https://${var.service_name}"
+}
+
+# Checks football-data.co.uk for newly published results and retrains only if
+# something changed. Runs before the archive job so the day's archived
+# predictions come from a model trained on the freshest available data.
+resource "google_cloud_scheduler_job" "daily_retrain" {
+  name      = "football-daily-retrain"
+  schedule  = var.retrain_cron
+  time_zone = var.schedule_tz
+  region    = var.region
+
+  # Training is a single long request; let it finish rather than retrying into
+  # a 409 from the in-progress lock.
+  attempt_deadline = "600s"
+  retry_config {
+    retry_count = 0
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.api.uri}/model/refresh"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+# One job per stream rather than one job submitting both: a Betfair outage
+# must not stop the model playing, and the two rows on the leaderboard should
+# fail independently.
+resource "google_cloud_scheduler_job" "daily_submit" {
+  for_each = toset(["model", "betfair"])
+
+  name      = "football-daily-submit-${each.key}"
+  schedule  = var.submit_cron
+  time_zone = var.schedule_tz
+  region    = var.region
+
+  attempt_deadline = "300s"
+  # Submissions are idempotent (Scorers overwrites on repeat POSTs), so a retry
+  # is safe and worth having - a missed deadline means no picks that round.
+  retry_config {
+    retry_count = 2
+  }
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.api.uri}/submissions/scorers?stream=${each.key}&limit=20"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
+    }
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
 resource "google_cloud_scheduler_job" "daily_archive" {
   name      = "football-daily-archive"
   schedule  = var.schedule_cron
@@ -317,12 +488,24 @@ resource "google_cloud_scheduler_job" "daily_archive" {
     http_method = "POST"
     uri         = "${google_cloud_run_v2_service.api.uri}/predictions/archive?limit=20"
     headers = {
-      "X-API-Key"    = "__SET_VIA_GCLOUD__" # populate manually after `terraform apply` (or use Secret Manager + gcloud)
       "Content-Type" = "application/json"
+    }
+    oidc_token {
+      service_account_email = google_service_account.scheduler.email
+      audience              = local.service_audience
     }
   }
 
   depends_on = [google_project_service.apis]
+}
+
+# Not strictly required while the service allows unauthenticated access, but
+# keeps the scheduler working if that's ever tightened.
+resource "google_cloud_run_v2_service_iam_member" "scheduler_invoker" {
+  name     = google_cloud_run_v2_service.api.name
+  location = google_cloud_run_v2_service.api.location
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.scheduler.email}"
 }
 
 # ----------------------------------------------------------------------
