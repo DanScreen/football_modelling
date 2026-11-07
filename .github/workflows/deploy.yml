@@ -1,8 +1,11 @@
 name: Deploy to Cloud Run
 
 on:
+  # main only. Deploying from more than one branch let a push to main ship a
+  # build without the Scorers submission routes that had only reached
+  # deploy_to_gcp, so the scheduler jobs started getting 404s.
   push:
-    branches: [main, deploy_to_gcp]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -47,6 +50,9 @@ jobs:
           service: ${{ env.SERVICE }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.IMAGE }}
+          # Keep in step with `timeout` in terraform/main.tf. Set here too so the
+          # value is applied on every deploy, not only after a terraform apply.
+          flags: --timeout=900
 
       - name: Show service URL
         run: gcloud run services describe ${{ env.SERVICE }} --region ${{ env.GCP_REGION }} --format='value(status.url)'

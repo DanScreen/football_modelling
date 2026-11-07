@@ -253,6 +253,14 @@ resource "google_cloud_run_v2_service" "api" {
   template {
     service_account = google_service_account.run.email
 
+    # Cloud Run's default request timeout is 300s, which is shorter than the
+    # retrain job's deadline and too close to how long submissions have been
+    # observed to take (128-213s). A request cut off at the timeout gets a 504,
+    # but its handler thread keeps running on the instance, so a killed retrain
+    # can go on competing for the single vCPU with the requests after it. Keep
+    # in step with the --timeout flag in .github/workflows/deploy.yml.
+    timeout = "900s"
+
     scaling {
       min_instance_count = 0
       max_instance_count = 2
@@ -424,8 +432,8 @@ resource "google_cloud_scheduler_job" "daily_retrain" {
   region    = var.region
 
   # Training is a single long request; let it finish rather than retrying into
-  # a 409 from the in-progress lock.
-  attempt_deadline = "600s"
+  # a 409 from the in-progress lock. Matches the Cloud Run request timeout.
+  attempt_deadline = "900s"
   retry_config {
     retry_count = 0
   }
@@ -456,7 +464,9 @@ resource "google_cloud_scheduler_job" "daily_submit" {
   time_zone = var.schedule_tz
   region    = var.region
 
-  attempt_deadline = "300s"
+  # Headroom over the slowest observed run (213s); a 300s deadline was being
+  # hit outright, and each retry then started from scratch.
+  attempt_deadline = "600s"
   # Submissions are idempotent (Scorers overwrites on repeat POSTs), so a retry
   # is safe and worth having - a missed deadline means no picks that round.
   retry_config {

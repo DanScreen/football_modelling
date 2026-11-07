@@ -707,8 +707,10 @@ Add the following to your GitHub repo:
   - `WIF_PROVIDER` — value of the `workload_identity_provider` Terraform output
   - `DEPLOYER_SA` — value of the `deployer_service_account` output
 
-Pushes to `main` or `deploy_to_gcp` will build the image, push it to Artifact Registry,
-and roll out a new Cloud Run revision.
+Pushes to `main` will build the image, push it to Artifact Registry, and roll out a new
+Cloud Run revision. Only `main` deploys: every branch shares one Cloud Run service, so a
+second deploying branch can silently replace the live code with an older build (that is
+how the Scorers routes went missing in October 2026). Land work on `main` to ship it.
 
 ### Daily flow
 
@@ -735,8 +737,10 @@ by hand and nothing for `terraform apply` to reset. The app verifies the token i
 (`OIDC_SERVICE_ACCOUNT` / `OIDC_AUDIENCE`) because the service has to stay publicly
 reachable for the bookmarked HTML views, so Cloud Run can't enforce it at the platform level.
 
-Note the Cloud Run request timeout is 300s. A full retrain currently takes ~25s, so there's
-plenty of headroom, but a much longer training run would need that raised.
+The Cloud Run request timeout is 900s (set in both `terraform/main.tf` and the deploy
+workflow's `--timeout` flag, so keep the two in step). The retrain job's scheduler deadline
+matches it, and the submit jobs allow 600s. Submissions have taken 128-213s in production,
+against the old 300s default, so leave that headroom in place until the cause is understood.
 
 ## Notebooks
 
